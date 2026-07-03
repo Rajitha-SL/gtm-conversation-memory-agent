@@ -27,5 +27,3 @@
 *   **API Rate Limit Handling:** Implements exponential backoff with jitter on all outgoing third-party calls (Clay API, CRM writes) using a centralized token-bucket rate limiter to prevent pipeline stagnation during peak processing loads.
 *   **LLM Timeout Mitigation:** The Python extraction worker wraps OpenAI/Anthropic API dispatches in a 15-second circuit breaker context; if a timeout occurs, the processing job is pushed back to the BullMQ dead-letter queue for automatic retry.
 *   **Context Fragmentation Prevention:** Long audio transcripts exceeding context windows are dynamically chunked using token-bounded overlapping sliding windows, ensuring cross-chunk semantic references are fully preserved before vector embeddings are generated.
-*   **LLM Timeout Mitigation:**
-*   **Context Fragmentation Prevention:**
