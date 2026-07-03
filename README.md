@@ -13,7 +13,7 @@
 ---
 
 ## 3. Database Schema & Data Models
-![Database ERD Schema](./assets/database-schema.png)
+![Database ERD Schema](database-schema.png)
 *Placeholder: We will export your dbdiagram.io layout and place it here.*
 
 ---
