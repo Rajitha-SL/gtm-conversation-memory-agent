@@ -1,13 +1,13 @@
 # GTM Engine: Closed-Loop Sales Conversation Memory & Outbound Agent
 
 ## 1. Executive Summary
-*   **The Manual Human Workflow:** [We will write this out together]
-*   **The Agentic Automation Goal:** [We will write this out together]
+*   **The Manual Human Workflow:** A human Account Executive conducts a sales call, manually identifies customer objections and competitor technical requirements from memory, manually captures raw notes inside a CRM, and subsequently relies on independent growth teams to cross-reference software databases for new target accounts experiencing similar technical constraints.
+*   **The Agentic Automation Goal:** An event-driven, automated pipeline that ingests post-call transcripts asynchronously, utilizes an LLM processing worker to automatically extract core pain points and technical constraints into a relational database and vector embedding store, and initiates an autonomous agent loop that leverages multi-vendor data enrichment waterfalls to programmatically launch highly hyper-targeted outbound email campaigns.
 
 ---
 
 ## 2. System Architecture Diagram
-![System Architecture Diagram](./assets/architecture-diagram.png)
+![System Architecture Diagram](architecture-diagram.png)
 *Placeholder: We will export your Whimsical layout and place it here.*
 
 ---
