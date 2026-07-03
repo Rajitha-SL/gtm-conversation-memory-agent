@@ -8,13 +8,11 @@
 
 ## 2. System Architecture Diagram
 ![System Architecture Diagram](architecture-diagram.png)
-*Placeholder: We will export your Whimsical layout and place it here.*
 
 ---
 
 ## 3. Database Schema & Data Models
 ![Database ERD Schema](database-schema.png)
-*Placeholder: We will export your dbdiagram.io layout and place it here.*
 
 ---
 
