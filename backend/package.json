@@ -4,10 +4,12 @@
   "description": "",
   "main": "server.js",
   "type": "module",
+
   "scripts": {
-    "start": "node server.js",
-    "worker": "node worker.js"
+    "start": "node --env-file=.env server.js",
+    "worker": "node --env-file=.env worker.js"
   },
+
   "keywords": [],
   "author": "",
   "license": "ISC",
