@@ -1,3 +1,4 @@
+import { dispatchToOutboundPipeline } from './services/clayDispatcher.js';
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { GoogleGenAI } from '@google/genai';
@@ -47,9 +48,9 @@ const transcriptWorker = new Worker(
       console.log(analysisText);
       console.log('--------------------------');
 
-      // 2. Write analysis data to database storage using Prisma
+      // 2. Write analysis data to database storage using Prisma (Assigned to 'record' variable)
       console.log(`💾 [Job #${job.id}] Writing analysis data to database storage...`);
-      await prisma.callSummary.create({
+      const record = await prisma.callSummary.create({
         data: {
           callId: callId,
           rawTranscript: transcript,
@@ -58,6 +59,18 @@ const transcriptWorker = new Worker(
       });
 
       console.log(`✅ [Job #${job.id}] Successfully saved to database table!`); 
+
+      // 3. Pass payload seamlessly to the outbound automated link
+      const triggered = await dispatchToOutboundPipeline(callId, analysisText);
+
+      if (triggered) {
+        await prisma.callSummary.update({
+          where: { id: record.id },
+          data: { outboundTriggered: true }
+        });
+        console.log(`🔄 [Job #${job.id}] Updated call summary status: outboundTriggered = true.`);
+      }
+      
     } catch (error) {
       console.error(`❌ [Job #${job.id}] AI/Database Layer Faulted:`, error.message);
       throw error; // Re-throw so BullMQ handles retry logging accurately

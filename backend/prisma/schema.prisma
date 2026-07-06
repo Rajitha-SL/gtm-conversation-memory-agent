@@ -11,6 +11,7 @@ model CallSummary {
   callId          String   @unique
   rawTranscript   String
   aiAnalysisPass  String
+  outboundTriggered Boolean @default(false) // ✨ Tracks pipeline state
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 }
