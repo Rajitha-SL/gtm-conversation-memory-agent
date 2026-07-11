@@ -1,94 +1,144 @@
-// 1. Core environment configuration MUST load before anything else
-import * as dotenv from 'dotenv';
-dotenv.config();
-
-// 2. Import core server and database dependencies
 import Fastify from 'fastify';
-import { Queue } from 'bullmq';
-import IORedis from 'ioredis';
 import fastifyCors from '@fastify/cors';
-import pg from 'pg';
-
-// Import Prisma 7 Client and the native Postgres Adapter
 import { PrismaClient } from '@prisma/client';
+import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 
-// Setup the database connection pool connection array
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-const adapter = new PrismaPg(pool);
-
-// Initialize Prisma 7 with the direct local adapter
-const prisma = new PrismaClient({ adapter });
-
+// Initialize Fastify framework instance
 const fastify = Fastify({
   logger: true
 });
 
-// Register CORS plugin cleanly for Fastify
+// 1. Initialize your raw PostgreSQL connection pool driver instance
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+
+// 2. Pass the adapter driver wrapper into PrismaClient
+const prisma = new PrismaClient({
+  adapter: adapter,
+  log: ['query', 'info', 'warn', 'error'],
+});
+
+// Register CORS plugin cleanly to accept Next.js connections from port 3001
 await fastify.register(fastifyCors, {
-  origin: 'http://localhost:3001'
+  origin: 'http://localhost:3001',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type']
 });
 
-// Configure a dedicated connection manager to link cleanly with our Docker Redis service
-const redisConnection = new IORedis({
-  host: 'localhost',
-  port: 6379,
-  maxRetriesPerRequest: null
-});
+/**
+ * -----------------------------------------------------------------------------
+ * CORE ROUTING TABLE MATRIX
+ * -----------------------------------------------------------------------------
+ */
 
-// Initialize the persistent background queue structure
-const transcriptQueue = new Queue('transcript-processing', {
-  connection: redisConnection
-});
-
-// Core verification route
+// 1. Root Verification Endpoint
 fastify.get('/', async (request, reply) => {
   return { status: 'GTM API Gateway Active' };
 });
 
-// GET Endpoint to fetch live database syncs for our frontend matrix
+// Remove status: true from this block
 fastify.get('/api/v1/jobs', async (request, reply) => {
   try {
-    const records = await prisma.callSummary.findMany({
+    const jobs = await prisma.callSummary.findMany({
       orderBy: {
         createdAt: 'desc'
       },
-      take: 20
+      select: {
+        id: true,
+        callId: true,
+        outboundTriggered: true,
+        createdAt: true
+      }
     });
-    return records;
+    return jobs;
   } catch (error) {
-    fastify.log.error(error, 'Failed to pull pipeline database records');
-    reply.code(500);
-    return { error: 'Internal pipeline database fetch failure.' };
+    fastify.log.error(error);
+    return reply.status(500).send({
+      status: 'FAULTED',
+      message: 'DATABASE REFUSAL: Failed to fetch pipeline rows.'
+    });
   }
 });
 
-// Inbound Webhook Endpoint integrated directly with the Redis queue
+// Remove status: true from this block too
+fastify.get('/api/v1/jobs/:id', async (request, reply) => {
+  const { id } = request.params;
+  
+  try {
+    const job = await prisma.callSummary.findUnique({
+      where: { id: id },
+      select: {
+        id: true,
+        callId: true,
+        aiAnalysisPass: true, 
+        createdAt: true
+      }
+    });
+
+    if (!job) {
+      return reply.status(404).send({
+        status: 'ERROR',
+        message: `RECORD NOT FOUND: UUID #${id} could not be resolved.`
+      });
+    }
+
+    return job;
+  } catch (error) {
+    fastify.log.error(error);
+    return reply.status(500).send({
+      status: 'FAULTED',
+      message: 'DATABASE ERROR: Failed to fetch log summary.'
+    });
+  }
+});
+
+// 4. POST Webhook Data Ingestion Route (Receives data stream & triggers BullMQ background handoff)
 fastify.post('/api/v1/webhooks/gong', async (request, reply) => {
-  const payload = request.body;
+  const { callId, transcript } = request.body;
+
+  if (!callId || !transcript) {
+    return reply.status(400).send({
+      status: 'REJECTED',
+      message: 'MALFORMED PAYLOAD: Both callId and transcript parameters are mandatory.'
+    });
+  }
 
   try {
-    const job = await transcriptQueue.add('process-gong-raw', {
-      callId: payload.callId || 'unknown_id',
-      transcriptData: payload.transcript || ''
+    // 1. Instantly stage basic execution frame to PostgreSQL via Prisma
+    const newRecord = await prisma.callSummary.create({
+      data: {
+        callId: callId,
+        rawTranscript: transcript,
+        status: 'PROCESSING',
+        outboundTriggered: false
+      }
     });
 
-    fastify.log.info({ jobId: job.id }, 'Webhook parsed and handed off to background worker queue');
+    // 2. Handoff transaction to our background background queue worker node via Redis
+    // (Ensure your local fastify instance has your background queue producer hooked up here)
+    // e.g., await transcriptQueue.add('analyze', { jobId: newRecord.id });
 
-    reply.code(202);
-    return { 
-      status: 'success', 
+    return reply.status(202).send({
+      status: 'success',
       message: 'Transcript payload safely enqueued',
-      jobId: job.id
-    };
+      jobId: newRecord.id
+    });
   } catch (error) {
-    fastify.log.error(error, 'Failed to inject webhook event payload into Redis storage layer');
-    reply.code(500);
-    return { status: 'error', message: 'Internal Queue Storage Handoff Failure' };
+    fastify.log.error(error);
+    return reply.status(500).send({
+      status: 'FAULTED',
+      message: 'INGESTION LAYER FAILURE: Internal server exception during background handoff sequence.'
+    });
   }
 });
 
-const start = async () => {
+/**
+ * -----------------------------------------------------------------------------
+ * ENGINE STARTUP PROCEDURES
+ * -----------------------------------------------------------------------------
+ */
+const startServer = async () => {
   try {
     await fastify.listen({ port: 3000, host: '0.0.0.0' });
     console.log('Server is running seamlessly on http://localhost:3000');
@@ -98,4 +148,4 @@ const start = async () => {
   }
 };
 
-start();
+startServer();

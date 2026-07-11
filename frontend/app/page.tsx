@@ -3,11 +3,19 @@
 import React, { useState, useEffect } from 'react';
 
 interface IngestionJob {
-  id: string;
+  id: string; 
   callId: string;
   geminiStatus: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAULTED';
   outboundState: 'PENDING' | 'TRIGGERED' | 'SIMULATED' | 'BLOCKED' | 'SKIPPED';
   timestamp: string;
+}
+
+interface JobDetail {
+  id: string;
+  callId: string;
+  status: string;
+  aiAnalysisPass: string; 
+  createdAt: string;
 }
 
 export default function LiveIngestionStream() {
@@ -15,7 +23,16 @@ export default function LiveIngestionStream() {
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Poll the backend API server on port 3000 for data
+  const [simCallId, setSimCallId] = useState('');
+  const [simTranscript, setSimTranscript] = useState('');
+  const [simLoading, setSimLoading] = useState(false);
+  const [simStatus, setSimStatus] = useState<{ type: 'idle' | 'success' | 'error'; message: string }>({ type: 'idle', message: '' });
+
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [jobDetail, setJobDetail] = useState<JobDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState<boolean>(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+
   useEffect(() => {
     async function fetchPipelineData() {
       try {
@@ -25,11 +42,10 @@ export default function LiveIngestionStream() {
         }
         const data = await response.json();
         
-        // Map the backend fields to our clean UI data model
         const formattedJobs = data.map((item: any) => ({
-          id: String(item.id),
+          id: String(item.id), 
           callId: item.callId || 'N/A',
-          geminiStatus: item.status || 'COMPLETED', // Maps fallback status
+          geminiStatus: item.status || 'COMPLETED',
           outboundState: item.outboundTriggered ? 'TRIGGERED' : 'SIMULATED',
           timestamp: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A'
         }));
@@ -43,11 +59,68 @@ export default function LiveIngestionStream() {
       }
     }
 
-    // Run fetch instantly, then poll every 3000ms
     fetchPipelineData();
     const interval = setInterval(fetchPipelineData, 3000);
     return () => clearInterval(interval);
   }, []);
+
+  const handleOpenDetails = async (id: string) => {
+    setSelectedJobId(id);
+    setDetailLoading(true);
+    setDetailError(null);
+    setJobDetail(null);
+
+    try {
+      const response = await fetch(`http://localhost:3000/api/v1/jobs/${id}`);
+      if (!response.ok) {
+        throw new Error(`Failed to load details. Server code: ${response.status}`);
+      }
+      const data = await response.json();
+      setJobDetail(data);
+    } catch (err: any) {
+      setDetailError(err.message || 'Could not reach backend lookup gateway.');
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const handleCloseDetails = () => {
+    setSelectedJobId(null);
+    setJobDetail(null);
+  };
+
+  const handlePipelineInjection = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!simCallId || !simTranscript) {
+      setSimStatus({ type: 'error', message: 'INSUFFICIENT DATA FIELDS: Please specify both Core Key and Transcript.' });
+      return;
+    }
+
+    setSimLoading(true);
+    setSimStatus({ type: 'idle', message: '' });
+
+    try {
+      const response = await fetch('http://localhost:3000/api/v1/webhooks/gong', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callId: simCallId, transcript: simTranscript }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        setSimStatus({ type: 'success', message: `TRANSACTION ACCEPTED // Job Enqueued: #${String(data.jobId).padStart(4, '0')}` });
+        setSimCallId('');
+        setSimTranscript('');
+      } else {
+        setSimStatus({ type: 'error', message: data.message || 'Pipeline ingestion handoff failure.' });
+      }
+    } catch (err) {
+      setSimStatus({ type: 'error', message: 'NETWORK REFUSAL: Unable to patch payload into port 3000.' });
+    } finally {
+      setSimLoading(false);
+    }
+  };
 
   const StatusBadge = ({ text }: { text: string }) => {
     const styles: Record<string, string> = {
@@ -69,7 +142,7 @@ export default function LiveIngestionStream() {
   };
 
   return (
-    <div className="min-h-screen bg-[#0A0B0D] text-[#E4E6EB] p-8 antialiased selection:bg-indigo-500/30">
+    <div className="min-h-screen bg-[#0A0B0D] text-[#E4E6EB] p-8 antialiased selection:bg-indigo-500/30 relative overflow-x-hidden">
       
       {/* Top Header Section */}
       <header className="flex justify-between items-center border-b border-[#1F2229] pb-6 mb-8">
@@ -97,6 +170,51 @@ export default function LiveIngestionStream() {
             <div className="text-[10px] font-mono text-[#4F535E] uppercase tracking-widest mt-1">{metric.sub}</div>
           </div>
         ))}
+      </section>
+
+      {/* Pipeline Ingestion Simulator Panel Block */}
+      <section className="bg-[#12141A] border border-[#1F2229] rounded-sm p-6 mb-8">
+        <h2 className="text-xs font-mono tracking-widest uppercase text-white font-bold mb-4">
+          Pipeline Ingestion Simulator
+        </h2>
+        <form onSubmit={handlePipelineInjection} className="space-y-4 font-mono text-xs">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+            <div className="md:col-span-1">
+              <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Source Core Key</label>
+              <input
+                type="text"
+                placeholder="e.g., call_test_700"
+                value={simCallId}
+                onChange={(e) => setSimCallId(e.target.value)}
+                className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
+              />
+            </div>
+            <div className="md:col-span-3">
+              <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Raw Transcript Stream Text</label>
+              <textarea
+                placeholder="Paste structural client meeting logs or conversations directly into buffer..."
+                value={simTranscript}
+                onChange={(e) => setSimTranscript(e.target.value)}
+                rows={2}
+                className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors resize-none placeholder-[#4F535E]"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between pt-2 border-t border-[#1F2229]/50">
+            <div className="h-4">
+              {simStatus.type === 'success' && <p className="text-emerald-400 font-semibold">{simStatus.message}</p>}
+              {simStatus.type === 'error' && <p className="text-rose-400 font-semibold">{simStatus.message}</p>}
+            </div>
+            <button
+              type="submit"
+              disabled={simLoading}
+              className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-1.5 px-4 rounded-sm tracking-widest uppercase transition-colors disabled:opacity-30 disabled:hover:bg-indigo-600"
+            >
+              {simLoading ? 'Injecting Context...' : 'Inject into Pipeline'}
+            </button>
+          </div>
+        </form>
       </section>
 
       {/* Primary Data Matrix Table */}
@@ -129,7 +247,14 @@ export default function LiveIngestionStream() {
               <tbody className="divide-y divide-[#1F2229]/60 font-mono text-xs">
                 {jobs.map((job) => (
                   <tr key={job.id} className="hover:bg-[#161920]/40 transition-colors group">
-                    <td className="py-4 px-6 text-indigo-400 font-semibold">#{job.id.padStart(4, '0')}</td>
+                    <td className="py-4 px-6">
+                      <button 
+                        onClick={() => handleOpenDetails(job.id)} 
+                        className="text-indigo-400 hover:text-indigo-300 font-semibold text-left underline focus:outline-none"
+                      >
+                        #{job.id.slice(0, 8)}...
+                      </button>
+                    </td>
                     <td className="py-4 px-6 font-semibold text-white tracking-wide">{job.callId}</td>
                     <td className="py-4 px-6"><StatusBadge text={job.geminiStatus} /></td>
                     <td className="py-4 px-6"><StatusBadge text={job.outboundState} /></td>
@@ -141,6 +266,59 @@ export default function LiveIngestionStream() {
           )}
         </div>
       </main>
+
+      {/* Slide-out Insights Overlay Drawer Component */}
+      <div className={`fixed top-0 right-0 h-full w-full sm:w-[550px] bg-[#0F1115] border-l border-[#1F2229] shadow-2xl transform transition-transform duration-300 ease-in-out z-50 p-6 flex flex-col ${selectedJobId ? 'translate-x-0' : 'translate-x-full'}`}>
+        <div className="flex justify-between items-center pb-4 border-b border-[#1F2229] mb-4">
+          <div>
+            <span className="text-[10px] font-mono tracking-widest text-indigo-400 uppercase font-bold">Pipeline Insight Summary</span>
+            <h3 className="text-md text-white font-mono mt-0.5">Job: #{selectedJobId?.slice(0, 12)}...</h3>
+          </div>
+          <button 
+            onClick={handleCloseDetails}
+            className="text-[#737885] hover:text-white font-mono text-sm border border-[#1F2229] px-2.5 py-1 rounded-sm bg-[#12141A] transition-colors"
+          >
+            ESC // CLOSE
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto font-mono text-xs text-[#E4E6EB] space-y-4 pr-1">
+          {detailLoading && (
+            <div className="h-full flex flex-col items-center justify-center text-[#737885] uppercase tracking-widest animate-pulse">
+              <span>Querying PostgreSQL Node...</span>
+            </div>
+          )}
+          
+          {detailError && (
+            <div className="p-4 border border-rose-900/40 bg-rose-950/20 text-rose-400 rounded-sm">
+              <span className="font-bold">CRITICAL EXCEPTION REJECTION</span>
+              <p className="mt-1 opacity-80">{detailError}</p>
+            </div>
+          )}
+
+          {jobDetail && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-2 bg-[#12141A] border border-[#1F2229] p-3 rounded-sm text-[11px]">
+                <div>
+                  <span className="text-[#4F535E] block">SOURCE CORE KEY:</span>
+                  <span className="text-white font-bold">{jobDetail.callId}</span>
+                </div>
+                <div>
+                  <span className="text-[#4F535E] block">TIMESTAMP COMMITTED:</span>
+                  <span className="text-zinc-400">{new Date(jobDetail.createdAt).toLocaleString()}</span>
+                </div>
+              </div>
+
+              <div className="pt-2">
+                <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Structured AI Report:</span>
+                <pre className="w-full bg-[#060709] border border-[#1F2229] rounded-sm p-4 text-[#E4E6EB] whitespace-pre-wrap font-sans text-sm leading-relaxed overflow-x-auto">
+                  {jobDetail.aiAnalysisPass || "No markdown payload generated for this job instance."}
+                </pre>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
