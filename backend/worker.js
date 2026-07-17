@@ -10,8 +10,7 @@ const logger = pino();
 
 logger.info('🔄 Background Worker Engine Initializing with AI Core...');
 
-// Initialize the Google Gen AI client library instance
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// We initialize the Google Gen AI client library dynamically per job execution to support user-configured BYO keys
 
 // Standard, native Prisma v7 driver adapter initialization 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
@@ -31,6 +30,8 @@ const transcriptWorker = new Worker(
     // Support both historical queue item naming formats to prevent pipeline blocks
     const callId = job.data.callId;
     const transcript = job.data.transcriptData || job.data.transcript;
+    const apiKey = job.data.geminiKey || process.env.GEMINI_API_KEY;
+    const ai = new GoogleGenAI({ apiKey });
 
     if (!transcript) {
       logger.warn({ jobId: job.id, callId }, 'No transcript string text found in job payload keys!');
@@ -67,7 +68,7 @@ const transcriptWorker = new Worker(
       logger.info({ jobId: job.id, callId }, 'Successfully saved to database table!'); 
 
       // 3. Pass payload seamlessly to the outbound automated link
-      const triggered = await dispatchToOutboundPipeline(callId, analysisText);
+      const triggered = await dispatchToOutboundPipeline(callId, analysisText, apiKey);
 
       if (triggered) {
         await prisma.callSummary.update({

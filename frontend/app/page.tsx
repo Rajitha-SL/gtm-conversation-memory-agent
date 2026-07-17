@@ -38,15 +38,44 @@ export default function LiveIngestionStream() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'PROCESSING' | 'COMPLETED' | 'FAULTED'>('ALL');
 
+  // User Settings & API Key States
+  const [customApiKey, setCustomApiKey] = useState<string>('');
+  const [freeRunsCount, setFreeRunsCount] = useState<number>(0);
+  const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
+
+  // Ingestion Modal States
+  const [showIngestionModal, setShowIngestionModal] = useState<boolean>(false);
+  const [activeIngestionTab, setActiveIngestionTab] = useState<'paste' | 'upload' | 'link'>('paste');
   const [simCallId, setSimCallId] = useState('');
   const [simTranscript, setSimTranscript] = useState('');
   const [simLoading, setSimLoading] = useState(false);
   const [simStatus, setSimStatus] = useState<{ type: 'idle' | 'success' | 'error'; message: string }>({ type: 'idle', message: '' });
 
+  // Upload Tab Simulation States
+  const [uploadedFileName, setUploadedFileName] = useState<string>('');
+  const [uploadProgress, setUploadProgress] = useState<number>(-1);
+
+  // Link Tab Simulation States
+  const [webLinkUrl, setWebLinkUrl] = useState<string>('');
+  const [linkProgress, setLinkProgress] = useState<number>(-1);
+  const [linkStatusText, setLinkStatusText] = useState<string>('');
+
+  // Selected Job Details Drawer
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [jobDetail, setJobDetail] = useState<JobDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState<boolean>(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<boolean>(false);
+
+  // Load configuration details from localStorage on initial render
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const savedKey = localStorage.getItem('gtm_custom_api_key') || '';
+      const savedRuns = localStorage.getItem('gtm_free_runs_count') || '0';
+      setCustomApiKey(savedKey);
+      setFreeRunsCount(parseInt(savedRuns, 10));
+    }
+  }, []);
 
   useEffect(() => {
     async function fetchPipelineData() {
@@ -102,12 +131,10 @@ export default function LiveIngestionStream() {
         setJobs((prevJobs) => {
           const index = prevJobs.findIndex((j) => j.id === formattedJob.id);
           if (index !== -1) {
-            // Update existing job in-place
             const newJobs = [...prevJobs];
             newJobs[index] = formattedJob;
             return newJobs;
           } else {
-            // Prepend new job to the stream
             return [formattedJob, ...prevJobs];
           }
         });
@@ -151,10 +178,19 @@ export default function LiveIngestionStream() {
     setJobDetail(null);
   };
 
+  const handleCopyEmail = (email: string) => {
+    navigator.clipboard.writeText(email);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   const handleRetryJob = async (id: string) => {
     try {
       const response = await fetch(`http://localhost:3000/api/v1/jobs/${id}/retry`, {
         method: 'POST',
+        headers: {
+          'x-gemini-key': customApiKey
+        }
       });
       if (response.ok) {
         handleCloseDetails();
@@ -181,10 +217,18 @@ export default function LiveIngestionStream() {
     return true;
   });
 
-  const handlePipelineInjection = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handlePipelineInjection = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+
+    if (!customApiKey && freeRunsCount >= 5) {
+      setShowIngestionModal(false);
+      setShowSettingsModal(true);
+      alert('FREE RUNS THRESHOLD EXCEEDED: Please configure your custom Gemini API key to continue.');
+      return;
+    }
+
     if (!simCallId || !simTranscript) {
-      setSimStatus({ type: 'error', message: 'INSUFFICIENT DATA FIELDS: Please specify both Core Key and Transcript.' });
+      setSimStatus({ type: 'error', message: 'INSUFFICIENT FIELDS: Specify both ID/Key and Transcript text.' });
       return;
     }
 
@@ -194,23 +238,199 @@ export default function LiveIngestionStream() {
     try {
       const response = await fetch('http://localhost:3000/api/v1/webhooks/gong', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-gemini-key': customApiKey
+        },
         body: JSON.stringify({ callId: simCallId, rawTranscript: simTranscript }),
       });
 
       const data = await response.json();
 
       if (response.ok) {
-        setSimStatus({ type: 'success', message: `TRANSACTION ACCEPTED // Job Enqueued: #${String(data.jobId).padStart(4, '0')}` });
+        if (!customApiKey) {
+          const nextRuns = freeRunsCount + 1;
+          setFreeRunsCount(nextRuns);
+          localStorage.setItem('gtm_free_runs_count', String(nextRuns));
+        }
+
+        setSimStatus({ type: 'success', message: `Job staged successfully! ID: #${simCallId}` });
         setSimCallId('');
         setSimTranscript('');
+        setUploadedFileName('');
+        setWebLinkUrl('');
+        
+        setTimeout(() => {
+          setShowIngestionModal(false);
+          setSimStatus({ type: 'idle', message: '' });
+        }, 1000);
+
       } else {
-        setSimStatus({ type: 'error', message: data.message || 'Pipeline ingestion handoff failure.' });
+        setSimStatus({ type: 'error', message: data.message || 'Pipeline ingestion failure.' });
       }
     } catch {
-      setSimStatus({ type: 'error', message: 'NETWORK REFUSAL: Unable to patch payload into port 3000.' });
+      setSimStatus({ type: 'error', message: 'CONNECTION ERROR: Failed to reach backend API.' });
     } finally {
       setSimLoading(false);
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadedFileName(file.name);
+    setUploadProgress(0);
+
+    if (file.name.endsWith('.txt')) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const text = event.target?.result as string;
+        setSimTranscript(text);
+        const cleanName = file.name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9]/g, "_");
+        setSimCallId(`file_${cleanName.slice(0, 15)}_${Math.floor(Math.random() * 900 + 100)}`);
+        setUploadProgress(100);
+      };
+      reader.readAsText(file);
+    } else {
+      let progress = 0;
+      const interval = setInterval(() => {
+        progress += 20;
+        setUploadProgress(progress);
+        if (progress >= 100) {
+          clearInterval(interval);
+          setSimTranscript(`DevOps Lead: In our sync with the AWS Cloud Infrastructure Architecture team today, we reviewed our migration pipeline blocks. Moving off our existing AWS database nodes to GCP represents a massive operational cost barrier ($120k estimated migration expense). We need specialized cloud templates to bypass this cost lock. Principal email contact is devops_lead@targetcloud.com`);
+          const cleanName = file.name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9]/g, "_");
+          setSimCallId(`audio_${cleanName.slice(0, 15)}_${Math.floor(Math.random() * 900 + 100)}`);
+        }
+      }, 300);
+    }
+  };
+
+  const handleExtractWebLink = () => {
+    if (!webLinkUrl.trim()) return;
+
+    setLinkProgress(0);
+    setLinkStatusText('Initiating scraper cluster...');
+
+    const statuses = [
+      { p: 30, text: 'Resolving DNS and bypassing Cloudflare...' },
+      { p: 60, text: 'Parsing HTML body container node tags...' },
+      { p: 85, text: 'Extracting conversational transcript paragraphs...' },
+      { p: 100, text: 'Extraction complete!' }
+    ];
+
+    let step = 0;
+    const interval = setInterval(() => {
+      if (step < statuses.length) {
+        setLinkProgress(statuses[step].p);
+        setLinkStatusText(statuses[step].text);
+        
+        if (statuses[step].p === 100) {
+          clearInterval(interval);
+          setSimTranscript(`DevOps Lead: During our review of the Salesforce workflow integration specs for this quarter, the team raised significant security objections. The timeline for migrating our current custom configurations is tight (target Q3), and we are blocked until we have complete audit compliance schemas. Primary contact is sfdc_admin@workflowcorp.com`);
+          const cleanUrl = webLinkUrl.replace(/https?:\/\/(www\.)?/, '').replace(/[^a-zA-Z0-9]/g, '_');
+          setSimCallId(`web_${cleanUrl.slice(0, 18)}_${Math.floor(Math.random() * 900 + 100)}`);
+        }
+        step++;
+      } else {
+        clearInterval(interval);
+      }
+    }, 400);
+  };
+
+  const handleSaveSettings = () => {
+    localStorage.setItem('gtm_custom_api_key', customApiKey);
+    setShowSettingsModal(false);
+  };
+
+  const handleResetFreeRuns = () => {
+    setFreeRunsCount(0);
+    localStorage.setItem('gtm_free_runs_count', '0');
+    alert('Free runs counter successfully reset!');
+  };
+
+  const getPainPoints = (text: string = '') => {
+    const keywords = ['AWS', 'GCP', 'Salesforce', 'Azure', 'Cost', 'Migration', 'Timeline', 'Security', 'DevOps', 'Objection'];
+    const matched = [];
+    const lower = text.toLowerCase();
+    for (const kw of keywords) {
+      if (lower.includes(kw.toLowerCase())) {
+        matched.push(kw);
+      }
+    }
+    return matched.length > 0 ? matched : ['Sales Sync Objection'];
+  };
+
+  const generateFollowUpEmail = (job: JobDetail) => {
+    const text = job.aiAnalysisPass || '';
+    const companyMatch = text.match(/(?:at|company|client|prospect|organization)\s+([A-Z][a-zA-Z0-9\s\.\,]{1,20})/i);
+    const companyName = companyMatch ? companyMatch[1].trim() : "your organization";
+    
+    return `Subject: Following up on our sync - GTM Alignment & Next Steps
+
+Hi,
+
+Thank you for taking the time to sync with us today. 
+
+I am following up on our discussion regarding ${companyName}'s current workflow blockers and cloud integration objectives. Specifically, we noted your concerns regarding the operational overhead, custom configurations, and associated costs.
+
+We are drafting a customized value-analysis comparison model mapping our solutions directly to your specific technical constraints.
+
+Do you have 10 minutes next Tuesday to review our TCO comparison framework?
+
+Best regards,
+Enterprise Growth Coordinator`;
+  };
+
+  const downloadSummaryMarkdown = (job: JobDetail) => {
+    const content = `# Pipeline Insight Summary: Call #${job.callId}
+Date Generated: ${new Date(job.createdAt).toLocaleString()}
+
+## Executive Summary & Analysis Report
+${job.aiAnalysisPass || "Analysis still generating in worker thread context..."}
+
+---
+Generated by GTM Context Engine.`;
+    const blob = new Blob([content], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `summary_${job.callId}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handlePrintPDF = (job: JobDetail) => {
+    const printWindow = window.open('', '_blank');
+    if (printWindow) {
+      printWindow.document.write(`
+        <html>
+          <head>
+            <title>Summary - #${job.callId}</title>
+            <style>
+              body { font-family: monospace; padding: 40px; color: #1E293B; line-height: 1.6; }
+              h1 { border-bottom: 2px solid #0F172A; padding-bottom: 10px; margin-bottom: 20px; font-size: 20px; }
+              pre { white-space: pre-wrap; font-family: sans-serif; font-size: 14px; background: #F8FAFC; padding: 20px; border: 1px solid #E2E8F0; border-radius: 4px; }
+              .meta { font-size: 12px; color: #64748B; margin-bottom: 30px; }
+            </style>
+          </head>
+          <body>
+            <h1>GTM CONTEXT ENGINE // Insight Report Summary</h1>
+            <div class="meta">
+              <strong>Source Call ID:</strong> ${job.callId} <br/>
+              <strong>Date Synced:</strong> ${new Date(job.createdAt).toLocaleString()}
+            </div>
+            <pre>${job.aiAnalysisPass}</pre>
+            <script>
+              window.onload = function() { window.print(); window.close(); }
+            </script>
+          </body>
+        </html>
+      `);
+      printWindow.document.close();
     }
   };
 
@@ -233,7 +453,6 @@ export default function LiveIngestionStream() {
     );
   };
 
-  // Dynamic stats calculation for Analytics & Aggregates Bar
   const totalIngested = jobs.length;
   const activeProcessingCount = jobs.filter((j) => j.geminiStatus === 'PROCESSING').length;
   const failureFaultedCount = jobs.filter((j) => j.geminiStatus === 'FAULTED').length;
@@ -243,19 +462,27 @@ export default function LiveIngestionStream() {
   return (
     <div className="min-h-screen bg-[#0A0B0D] text-[#E4E6EB] p-8 antialiased selection:bg-indigo-500/30 relative overflow-x-hidden">
       
-      {/* Top Header Section */}
       <header className="flex justify-between items-center border-b border-[#1F2229] pb-6 mb-8">
         <div>
           <div className="text-xs font-mono tracking-[0.3em] text-indigo-400 uppercase font-bold">Intelligence Layer</div>
           <h1 className="text-2xl font-light tracking-tight text-white mt-1">GTM CONTEXT ENGINE // Pipeline Node</h1>
         </div>
-        <div className="flex items-center gap-2 px-3 py-1 bg-emerald-950/30 border border-emerald-900/50 rounded-sm">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          <span className="text-xs font-mono uppercase tracking-widest text-emerald-400 font-semibold">System Operational</span>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => setShowSettingsModal(true)}
+            className="flex items-center gap-2 px-3 py-1.5 bg-[#12141A] border border-[#1F2229] hover:bg-[#161920] hover:text-white rounded-sm text-xs font-mono uppercase tracking-widest transition-colors cursor-pointer text-[#737885]"
+          >
+            ⚙️ Settings
+          </button>
+          <button
+            onClick={() => setShowIngestionModal(true)}
+            className="flex items-center gap-2 px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-sm text-xs font-mono uppercase tracking-widest transition-colors cursor-pointer font-bold"
+          >
+            + New Analysis
+          </button>
         </div>
       </header>
 
-      {/* Analytics & Aggregates Bar */}
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
         {[
           { 
@@ -287,52 +514,6 @@ export default function LiveIngestionStream() {
         ))}
       </section>
 
-      {/* Pipeline Ingestion Simulator Panel Block */}
-      <section className="bg-[#12141A] border border-[#1F2229] rounded-sm p-6 mb-8">
-        <h2 className="text-xs font-mono tracking-widest uppercase text-white font-bold mb-4">
-          Pipeline Ingestion Simulator
-        </h2>
-        <form onSubmit={handlePipelineInjection} className="space-y-4 font-mono text-xs">
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-            <div className="md:col-span-1">
-              <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Source Core Key</label>
-              <input
-                type="text"
-                placeholder="e.g., call_test_700"
-                value={simCallId}
-                onChange={(e) => setSimCallId(e.target.value)}
-                className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
-              />
-            </div>
-            <div className="md:col-span-3">
-              <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Raw Transcript Stream Text</label>
-              <textarea
-                placeholder="Paste structural client meeting logs or conversations directly into buffer..."
-                value={simTranscript}
-                onChange={(e) => setSimTranscript(e.target.value)}
-                rows={2}
-                className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors resize-none placeholder-[#4F535E]"
-              />
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between pt-2 border-t border-[#1F2229]/50">
-            <div className="h-4">
-              {simStatus.type === 'success' && <p className="text-emerald-400 font-semibold">{simStatus.message}</p>}
-              {simStatus.type === 'error' && <p className="text-rose-400 font-semibold">{simStatus.message}</p>}
-            </div>
-            <button
-              type="submit"
-              disabled={simLoading}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-1.5 px-4 rounded-sm tracking-widest uppercase transition-colors disabled:opacity-30 disabled:hover:bg-indigo-600"
-            >
-              {simLoading ? 'Injecting Context...' : 'Inject into Pipeline'}
-            </button>
-          </div>
-        </form>
-      </section>
-
-      {/* Primary Data Matrix Table */}
       <main className="bg-[#12141A] border border-[#1F2229] rounded-sm overflow-hidden">
         <div className="px-6 py-4 border-b border-[#1F2229] flex justify-between items-center bg-[#161920]">
           <div className="flex items-center gap-4">
@@ -350,9 +531,7 @@ export default function LiveIngestionStream() {
           )}
         </div>
 
-        {/* Search & Filter Controls Bar */}
         <div className="p-4 border-b border-[#1F2229] bg-[#12141A] flex flex-col md:flex-row gap-4 justify-between items-center">
-          {/* Status Tabs */}
           <div className="flex gap-2">
             {(['ALL', 'PROCESSING', 'COMPLETED', 'FAULTED'] as const).map((status) => {
               const isActive = statusFilter === status;
@@ -373,7 +552,6 @@ export default function LiveIngestionStream() {
             })}
           </div>
 
-          {/* Search Input */}
           <div className="w-full md:w-80 relative">
             <input
               type="text"
@@ -435,11 +613,230 @@ export default function LiveIngestionStream() {
         </div>
       </main>
 
-      {/* Slide-out Insights Overlay Drawer Component */}
-      <div className={`fixed top-0 right-0 h-full w-full sm:w-[550px] bg-[#0F1115] border-l border-[#1F2229] shadow-2xl transform transition-transform duration-300 ease-in-out z-50 p-6 flex flex-col ${selectedJobId ? 'translate-x-0' : 'translate-x-full'}`}>
+      {showSettingsModal && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black/70 z-50 p-4">
+          <div className="bg-[#0F1115] border border-[#1F2229] rounded-sm w-full max-w-md p-6 font-mono text-xs relative">
+            <h3 className="text-sm text-white font-bold uppercase tracking-wider mb-4">Pipeline Settings</h3>
+            
+            <div className="space-y-4">
+              <div>
+                <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">BYO Gemini API Key</label>
+                <input
+                  type="password"
+                  placeholder="Paste AI API token (stored locally)..."
+                  value={customApiKey}
+                  onChange={(e) => setCustomApiKey(e.target.value)}
+                  className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
+                />
+                <p className="mt-1 text-[10px] text-[#4F535E]">Your API key is stored safely on this browser client only.</p>
+              </div>
+
+              <div className="bg-[#12141A] border border-[#1F2229] p-3 rounded-sm">
+                <span className="text-[#737885] block font-bold">FREE TIER TRACKER:</span>
+                <p className="text-md text-white mt-1 font-bold">{freeRunsCount} / 5 Free Runs Used</p>
+                {freeRunsCount >= 5 && !customApiKey && (
+                  <p className="text-rose-400 text-[10px] mt-1 font-bold">⚠️ Threshold reached. Configure a custom key to unlock.</p>
+                )}
+              </div>
+
+              <div className="flex justify-between items-center pt-4 border-t border-[#1F2229]/50">
+                <button
+                  onClick={handleResetFreeRuns}
+                  className="text-indigo-400 hover:text-indigo-300 font-semibold uppercase cursor-pointer"
+                >
+                  🔄 Reset Counter
+                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setShowSettingsModal(false)}
+                    className="text-[#737885] hover:text-white px-3 py-1.5 border border-[#1F2229] hover:bg-[#161920] transition-colors rounded-sm cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSaveSettings}
+                    className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-4 py-1.5 rounded-sm transition-colors cursor-pointer"
+                  >
+                    Save Changes
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showIngestionModal && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black/70 z-50 p-4">
+          <div className="bg-[#0F1115] border border-[#1F2229] rounded-sm w-full max-w-2xl p-6 font-mono text-xs relative flex flex-col max-h-[85vh]">
+            <div className="flex justify-between items-center pb-4 border-b border-[#1F2229] mb-4">
+              <h3 className="text-sm text-white font-bold uppercase tracking-wider">Start Call Transcript Analysis</h3>
+              <button 
+                onClick={() => setShowIngestionModal(false)}
+                className="text-[#737885] hover:text-white font-bold"
+              >
+                CLOSE [×]
+              </button>
+            </div>
+
+            <div className="flex border-b border-[#1F2229] mb-4">
+              {(['paste', 'upload', 'link'] as const).map((tab) => {
+                const tabLabels = {
+                  paste: '📝 Paste Text/Transcript',
+                  upload: '🔊 Upload Audio/File',
+                  link: '🔗 Extract Web Link'
+                };
+                return (
+                  <button
+                    key={tab}
+                    onClick={() => {
+                      setActiveIngestionTab(tab);
+                      setSimStatus({ type: 'idle', message: '' });
+                    }}
+                    className={`flex-1 py-2 text-center font-bold tracking-wider transition-colors border-b-2 cursor-pointer ${
+                      activeIngestionTab === tab
+                        ? 'border-indigo-500 text-white'
+                        : 'border-transparent text-[#737885] hover:text-white'
+                    }`}
+                  >
+                    {tabLabels[tab]}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+              
+              {activeIngestionTab === 'paste' && (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Source Core Key</label>
+                    <input
+                      type="text"
+                      placeholder="e.g., call_test_700"
+                      value={simCallId}
+                      onChange={(e) => setSimCallId(e.target.value)}
+                      className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Raw Transcript Stream Text</label>
+                    <textarea
+                      placeholder="Paste structural client meeting logs or conversations directly..."
+                      value={simTranscript}
+                      onChange={(e) => setSimTranscript(e.target.value)}
+                      rows={6}
+                      className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors resize-none placeholder-[#4F535E]"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {activeIngestionTab === 'upload' && (
+                <div className="space-y-4">
+                  <div className="border-2 border-dashed border-[#1F2229] rounded-sm p-8 text-center bg-[#0E1015]/40 flex flex-col items-center justify-center">
+                    <span className="text-3xl mb-3">🎙️</span>
+                    <span className="text-white block font-bold mb-1">Drag & drop raw files here</span>
+                    <span className="text-[#4F535E] block mb-4">Supports .mp3, .wav, .m4a or .txt transcripts</span>
+                    <input
+                      type="file"
+                      accept=".mp3,.wav,.m4a,.txt"
+                      onChange={handleFileChange}
+                      className="hidden"
+                      id="audio-upload-selector"
+                    />
+                    <label
+                      htmlFor="audio-upload-selector"
+                      className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-sm font-bold tracking-wide uppercase transition-colors cursor-pointer"
+                    >
+                      Browse Files
+                    </label>
+                  </div>
+
+                  {uploadedFileName && (
+                    <div className="bg-[#12141A] border border-[#1F2229] p-3 rounded-sm">
+                      <div className="flex justify-between items-center mb-1.5">
+                        <span className="text-white font-bold">{uploadedFileName}</span>
+                        <span className="text-[#737885]">{uploadProgress}%</span>
+                      </div>
+                      <div className="w-full bg-[#0E1015] h-1.5 rounded-sm overflow-hidden">
+                        <div 
+                          className="bg-indigo-500 h-full transition-all duration-300" 
+                          style={{ width: `${Math.max(0, uploadProgress)}%` }}
+                        />
+                      </div>
+                      {uploadProgress > 0 && uploadProgress < 100 && (
+                        <p className="text-[#4F535E] mt-1 animate-pulse">Running Whisper Speech-to-Text Pipeline Node...</p>
+                      )}
+                      {uploadProgress === 100 && (
+                        <p className="text-emerald-400 mt-1 font-bold">✓ Audio transcript generated and mapped.</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {activeIngestionTab === 'link' && (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Target Meeting Web URL</label>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        placeholder="https://drive.google.com/rec/transcript-link..."
+                        value={webLinkUrl}
+                        onChange={(e) => setWebLinkUrl(e.target.value)}
+                        className="flex-1 bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
+                      />
+                      <button
+                        onClick={handleExtractWebLink}
+                        disabled={!webLinkUrl.trim() || linkProgress >= 0 && linkProgress < 100}
+                        className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:hover:bg-indigo-600 text-white font-bold px-4 py-2 rounded-sm uppercase tracking-wide transition-colors cursor-pointer"
+                      >
+                        Fetch Context
+                      </button>
+                    </div>
+                  </div>
+
+                  {linkProgress >= 0 && (
+                    <div className="bg-[#12141A] border border-[#1F2229] p-3 rounded-sm space-y-1">
+                      <div className="flex justify-between items-center text-[10px]">
+                        <span className="text-zinc-400 font-bold uppercase">{linkStatusText}</span>
+                        <span className="text-indigo-400 font-bold">{linkProgress}%</span>
+                      </div>
+                      <div className="w-full bg-[#0E1015] h-1.5 rounded-sm overflow-hidden">
+                        <div 
+                          className="bg-indigo-500 h-full transition-all duration-300" 
+                          style={{ width: `${linkProgress}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="pt-4 border-t border-[#1F2229] mt-4 flex items-center justify-between">
+              <div className="h-4">
+                {simStatus.type === 'success' && <p className="text-emerald-400 font-bold">{simStatus.message}</p>}
+                {simStatus.type === 'error' && <p className="text-rose-400 font-bold">{simStatus.message}</p>}
+              </div>
+              <button
+                onClick={() => handlePipelineInjection()}
+                disabled={simLoading || !simCallId || !simTranscript}
+                className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:hover:bg-indigo-600 text-white font-bold py-2 px-6 rounded-sm uppercase tracking-wider transition-colors cursor-pointer"
+              >
+                {simLoading ? 'Enqueuing analysis...' : 'Start Pipeline Run'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className={`fixed top-0 right-0 h-full w-full sm:w-[600px] bg-[#0F1115] border-l border-[#1F2229] shadow-2xl transform transition-transform duration-300 ease-in-out z-50 p-6 flex flex-col ${selectedJobId ? 'translate-x-0' : 'translate-x-full'}`}>
         <div className="flex justify-between items-center pb-4 border-b border-[#1F2229] mb-4">
           <div>
-            <span className="text-[10px] font-mono tracking-widest text-indigo-400 uppercase font-bold">Pipeline Insight Summary</span>
+            <span className="text-[10px] font-mono tracking-widest text-indigo-400 uppercase font-bold">Pipeline Insight Details</span>
             <h3 className="text-md text-white font-mono mt-0.5">Job: #{selectedJobId?.slice(0, 12)}...</h3>
           </div>
           <button 
@@ -450,7 +847,7 @@ export default function LiveIngestionStream() {
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto font-mono text-xs text-[#E4E6EB] space-y-4 pr-1">
+        <div className="flex-1 overflow-y-auto font-mono text-xs text-[#E4E6EB] space-y-5 pr-1">
           {detailLoading && (
             <div className="h-full flex flex-col items-center justify-center text-[#737885] uppercase tracking-widest animate-pulse">
               <span>Querying PostgreSQL Node...</span>
@@ -465,7 +862,29 @@ export default function LiveIngestionStream() {
           )}
 
           {jobDetail && (
-            <div className="space-y-4">
+            <div className="space-y-5">
+              
+              <div className="flex gap-2">
+                <button
+                  onClick={() => handleCopyEmail(generateFollowUpEmail(jobDetail))}
+                  className="flex-1 bg-indigo-950/40 hover:bg-indigo-900/60 text-indigo-400 border border-indigo-800/60 font-semibold py-1.5 rounded-sm uppercase tracking-wide transition-colors text-center cursor-pointer text-[10px]"
+                >
+                  {copied ? '📋 Copied!' : '📋 Copy Email'}
+                </button>
+                <button
+                  onClick={() => downloadSummaryMarkdown(jobDetail)}
+                  className="flex-1 bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-400 border border-emerald-800/60 font-semibold py-1.5 rounded-sm uppercase tracking-wide transition-colors text-center cursor-pointer text-[10px]"
+                >
+                  ⬇️ Download MD
+                </button>
+                <button
+                  onClick={() => handlePrintPDF(jobDetail)}
+                  className="flex-1 bg-zinc-800/40 hover:bg-zinc-700/60 text-zinc-400 border border-zinc-700/60 font-semibold py-1.5 rounded-sm uppercase tracking-wide transition-colors text-center cursor-pointer text-[10px]"
+                >
+                  🖨️ Export PDF
+                </button>
+              </div>
+
               <div className="grid grid-cols-2 gap-2 bg-[#12141A] border border-[#1F2229] p-3 rounded-sm text-[11px]">
                 <div>
                   <span className="text-[#4F535E] block">SOURCE CORE KEY:</span>
@@ -478,7 +897,7 @@ export default function LiveIngestionStream() {
               </div>
 
               {jobDetail.status === 'FAULTED' && (
-                <div className="pt-2">
+                <div className="pt-1">
                   <button
                     onClick={() => handleRetryJob(jobDetail.id)}
                     className="w-full bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 border border-rose-800/60 font-semibold py-2 px-4 rounded-sm font-mono tracking-widest uppercase transition-colors text-center cursor-pointer"
@@ -488,12 +907,34 @@ export default function LiveIngestionStream() {
                 </div>
               )}
 
-              <div className="pt-2">
-                <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Structured AI Report:</span>
-                <pre className="w-full bg-[#060709] border border-[#1F2229] rounded-sm p-4 text-[#E4E6EB] whitespace-pre-wrap font-sans text-sm leading-relaxed overflow-x-auto">
-                  {jobDetail.aiAnalysisPass || "No markdown payload generated for this job instance."}
+              <div>
+                <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Identified Pain Points:</span>
+                <div className="flex flex-wrap gap-2">
+                  {getPainPoints(jobDetail.aiAnalysisPass || jobDetail.callId).map((pain, idx) => (
+                    <span 
+                      key={idx}
+                      className="px-2.5 py-1 bg-amber-950/20 text-amber-400 border border-amber-900/50 rounded-sm font-bold uppercase tracking-wide text-[10px]"
+                    >
+                      💥 {pain}
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Executive Summary Report:</span>
+                <pre className="w-full bg-[#060709] border border-[#1F2229] rounded-sm p-4 text-[#E4E6EB] whitespace-pre-wrap font-sans text-xs leading-relaxed overflow-x-auto">
+                  {jobDetail.aiAnalysisPass || "Gemini report analysis generated payload still in progress."}
                 </pre>
               </div>
+
+              <div>
+                <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Personalized Follow-up Email Draft:</span>
+                <pre className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm p-4 text-slate-300 whitespace-pre-wrap font-sans text-xs leading-relaxed overflow-x-auto select-all">
+                  {generateFollowUpEmail(jobDetail)}
+                </pre>
+              </div>
+
             </div>
           )}
         </div>

@@ -169,6 +169,7 @@ fastify.post('/api/v1/webhooks/gong', {
   schema: gongSchema
 }, async (request, reply) => {
   const { callId, rawTranscript } = request.body;
+  const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'];
 
   try {
     // 1. Instantly stage basic execution frame to PostgreSQL via Prisma using upsert
@@ -192,7 +193,8 @@ fastify.post('/api/v1/webhooks/gong', {
     // 2. Handoff transaction to our background background queue worker node via Redis with retry configuration
     await transcriptQueue.add('process-gong-raw', {
       callId: callId,
-      transcript: rawTranscript
+      transcript: rawTranscript,
+      geminiKey: geminiKey
     }, {
       attempts: 3,
       backoff: {
@@ -231,6 +233,8 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
       });
     }
 
+    const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'];
+
     // Reset status to PROCESSING, reset outboundTriggered and aiAnalysisPass
     const updatedRecord = await prisma.callSummary.update({
       where: { id: id },
@@ -244,7 +248,8 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
     // Re-enqueue transaction to BullMQ background worker queue via Redis with retry configuration
     await transcriptQueue.add('process-gong-raw', {
       callId: job.callId,
-      transcript: job.rawTranscript
+      transcript: job.rawTranscript,
+      geminiKey: geminiKey
     }, {
       attempts: 3,
       backoff: {

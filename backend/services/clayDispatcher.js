@@ -2,13 +2,13 @@ import { GoogleGenAI } from '@google/genai';
 import pino from 'pino';
 
 const logger = pino();
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
 /**
  * Parses the structured summary, extracts target intent parameters, 
  * and dispatches them to the external Clay enrichment waterfall.
  */
-export async function dispatchToOutboundPipeline(callId, analysisText) {
+export async function dispatchToOutboundPipeline(callId, analysisText, customApiKey) {
+  const apiKey = customApiKey || process.env.GEMINI_API_KEY;
+  const ai = new GoogleGenAI({ apiKey });
   logger.info({ callId }, '🔗 [Outbound Link] Extracting market target profiles...');
 
   try {
