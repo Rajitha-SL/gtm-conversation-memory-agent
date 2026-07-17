@@ -31,7 +31,11 @@ interface DBJobPayload {
 }
 
 export default function LiveIngestionStream() {
-  const API_BASE = typeof window !== 'undefined' ? (window.location.protocol + '//' + window.location.hostname + ':3000') : 'http://localhost:3000';
+  const API_BASE = typeof window !== 'undefined' 
+    ? (window.location.hostname.includes('localhost') || window.location.hostname.includes('127.0.0.1') || window.location.hostname.includes('[::1]')
+      ? `${window.location.protocol}//${window.location.hostname}:3000`
+      : `${window.location.protocol}//${window.location.hostname.replace('3001', '3000')}`)
+    : 'http://localhost:3000';
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -271,7 +275,8 @@ export default function LiveIngestionStream() {
       } else {
         setSimStatus({ type: 'error', message: data.message || 'Pipeline ingestion failure.' });
       }
-    } catch {
+    } catch (err) {
+      console.error('Fetch execution error details:', err);
       setSimStatus({ type: 'error', message: 'CONNECTION ERROR: Failed to reach backend API.' });
     } finally {
       setSimLoading(false);
