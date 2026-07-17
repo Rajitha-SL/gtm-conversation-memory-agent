@@ -372,8 +372,25 @@ export default function LiveIngestionStream() {
 
   const generateFollowUpEmail = (job: JobDetail) => {
     const text = job.aiAnalysisPass || '';
-    const companyMatch = text.match(/(?:at|company|client|prospect|organization)\s+([A-Z][a-zA-Z0-9\s\.\,]{1,20})/i);
-    const companyName = companyMatch ? companyMatch[1].trim() : "your organization";
+    
+    let companyName = "your organization";
+    
+    // 1. Try to find company name in the Meeting Title block
+    const meetingTitleMatch = text.match(/Meeting\s+Title:\s*\**\s*([A-Za-z0-9\s\.\,\-\&]{2,50})/i);
+    if (meetingTitleMatch) {
+      const cleaned = meetingTitleMatch[1].split(/(?:prospect|partner|sync|-|addressing|meeting|customer)/i)[0].trim();
+      if (cleaned && cleaned.length > 2) {
+        companyName = cleaned;
+      }
+    }
+
+    // 2. Fallback to basic match but exclude common false matches like 'Concern' or 'Prospect'
+    if (companyName === "your organization") {
+      const companyMatch = text.match(/(?:at|company|client|organization)\s+([A-Z][a-zA-Z0-9\s\.\,]{2,20})/);
+      if (companyMatch) {
+        companyName = companyMatch[1].trim();
+      }
+    }
     
     return `Subject: Following up on our sync - GTM Alignment & Next Steps
 
