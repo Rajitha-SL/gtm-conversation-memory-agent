@@ -31,6 +31,7 @@ interface DBJobPayload {
 }
 
 export default function LiveIngestionStream() {
+  const API_BASE = typeof window !== 'undefined' ? (window.location.protocol + '//' + window.location.hostname + ':3000') : 'http://localhost:3000';
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -80,7 +81,7 @@ export default function LiveIngestionStream() {
   useEffect(() => {
     async function fetchPipelineData() {
       try {
-        const response = await fetch('http://localhost:3000/api/v1/jobs');
+        const response = await fetch(`${API_BASE}/api/v1/jobs`);
         if (!response.ok) {
           throw new Error(`Server returned status: ${response.status}`);
         }
@@ -108,7 +109,7 @@ export default function LiveIngestionStream() {
     fetchPipelineData();
 
     // Establish Server-Sent Events (SSE) connection for real-time updates
-    const eventSource = new EventSource('http://localhost:3000/api/v1/jobs/stream');
+    const eventSource = new EventSource(`${API_BASE}/api/v1/jobs/stream`);
 
     eventSource.onopen = () => {
       console.log('SSE connection successfully opened');
@@ -160,7 +161,7 @@ export default function LiveIngestionStream() {
     setJobDetail(null);
 
     try {
-      const response = await fetch(`http://localhost:3000/api/v1/jobs/${id}`);
+      const response = await fetch(`${API_BASE}/api/v1/jobs/${id}`);
       if (!response.ok) {
         throw new Error(`Failed to load details. Server code: ${response.status}`);
       }
@@ -186,7 +187,7 @@ export default function LiveIngestionStream() {
 
   const handleRetryJob = async (id: string) => {
     try {
-      const response = await fetch(`http://localhost:3000/api/v1/jobs/${id}/retry`, {
+      const response = await fetch(`${API_BASE}/api/v1/jobs/${id}/retry`, {
         method: 'POST',
         headers: {
           'x-gemini-key': customApiKey
@@ -238,7 +239,7 @@ export default function LiveIngestionStream() {
     setSimStatus({ type: 'idle', message: '' });
 
     try {
-      const response = await fetch('http://localhost:3000/api/v1/webhooks/gong', {
+      const response = await fetch(`${API_BASE}/api/v1/webhooks/gong`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',

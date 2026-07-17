@@ -41,9 +41,9 @@ const listenClient = new pg.Client({ connectionString: process.env.DATABASE_URL 
 
 // Register CORS plugin cleanly to accept Next.js connections from port 3001
 await fastify.register(fastifyCors, {
-  origin: 'http://localhost:3001',
+  origin: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type']
+  allowedHeaders: ['Content-Type', 'x-gemini-key', 'x-api-key']
 });
 
 // Register Rate Limit plugin globally
