@@ -1,4 +1,5 @@
 import { dispatchToOutboundPipeline } from './services/clayDispatcher.js';
+import { dispatchToSlack } from './services/slackNotifier.js';
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { GoogleGenAI } from '@google/genai';
@@ -33,6 +34,7 @@ const transcriptWorker = new Worker(
     const apiKey = job.data.geminiKey || process.env.GEMINI_API_KEY;
     const provider = job.data.provider || (apiKey?.startsWith('sk-or-') ? 'openrouter' : 'gemini');
     const modelName = job.data.modelName || (provider === 'openrouter' ? 'anthropic/claude-3.5-sonnet' : 'gemini-2.5-flash');
+    const slackWebhookUrl = job.data.slackWebhookUrl;
 
     if (!transcript) {
       logger.warn({ jobId: job.id, callId }, 'No transcript string text found in job payload keys!');
@@ -144,6 +146,9 @@ const transcriptWorker = new Worker(
         });
         logger.info({ jobId: job.id, callId }, 'Updated call summary status: outboundTriggered = true.');
       }
+
+      // 4. Send Slack notification alert if configured or simulated
+      await dispatchToSlack(slackWebhookUrl, callId, cleanAnalysis);
       
     } catch (error) {
       logger.error({ jobId: job.id, callId, error: error.message, stack: error.stack }, 'AI/Database Layer Faulted');

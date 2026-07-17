@@ -49,6 +49,10 @@ export default function LiveIngestionStream() {
   const [modelName, setModelName] = useState<string>('anthropic/claude-3.5-sonnet');
   const [freeRunsCount, setFreeRunsCount] = useState<number>(0);
   const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
+  const [slackWebhookUrl, setSlackWebhookUrl] = useState<string>('');
+  const [dealRiskFilter, setDealRiskFilter] = useState<'ALL' | 'Low' | 'Medium' | 'High'>('ALL');
+  const [selectedTone, setSelectedTone] = useState<'Formal' | 'Casual' | 'Urgent' | 'Value-Led'>('Value-Led');
+  const [slackToasts, setSlackToasts] = useState<Array<{ id: string; callId: string; risk: 'Low' | 'Medium' | 'High' }>>([]);
 
   // Ingestion Modal States
   const [showIngestionModal, setShowIngestionModal] = useState<boolean>(false);
@@ -86,10 +90,12 @@ export default function LiveIngestionStream() {
       const savedRuns = localStorage.getItem('gtm_free_runs_count') || '0';
       const savedProvider = localStorage.getItem('gtm_api_provider') as 'openrouter' | 'gemini' || 'openrouter';
       const savedModel = localStorage.getItem('gtm_model_name') || 'anthropic/claude-3.5-sonnet';
+      const savedSlackWebhook = localStorage.getItem('gtm_slack_webhook_url') || '';
       setCustomApiKey(savedKey);
       setFreeRunsCount(parseInt(savedRuns, 10));
       setApiProvider(savedProvider);
       setModelName(savedModel);
+      setSlackWebhookUrl(savedSlackWebhook);
     }
   }, []);
 
@@ -143,6 +149,22 @@ export default function LiveIngestionStream() {
           rawTranscript: updatedJob.rawTranscript || '',
           aiAnalysisPass: updatedJob.aiAnalysisPass || ''
         };
+
+        if (updatedJob.status === 'COMPLETED' && updatedJob.aiAnalysisPass) {
+          try {
+            const parsed = JSON.parse(updatedJob.aiAnalysisPass);
+            const score = parsed.dealRiskScore || 'Low';
+            if (score === 'High' || score === 'Medium') {
+              const toastId = Math.random().toString();
+              setSlackToasts((prev) => [...prev, { id: toastId, callId: updatedJob.callId, risk: score }]);
+              setTimeout(() => {
+                setSlackToasts((prev) => prev.filter((t) => t.id !== toastId));
+              }, 5500);
+            }
+          } catch (e) {
+            // Ignore parse errors on older summaries
+          }
+        }
 
         setJobs((prevJobs) => {
           const index = prevJobs.findIndex((j) => j.id === formattedJob.id);
@@ -207,7 +229,8 @@ export default function LiveIngestionStream() {
         headers: {
           'x-gemini-key': customApiKey,
           'x-ai-provider': apiProvider,
-          'x-model-name': modelName
+          'x-model-name': modelName,
+          'x-slack-webhook-url': slackWebhookUrl
         }
       });
       if (response.ok) {
@@ -258,6 +281,12 @@ export default function LiveIngestionStream() {
     if (statusFilter !== 'ALL' && job.geminiStatus !== statusFilter) {
       return false;
     }
+    if (dealRiskFilter !== 'ALL') {
+      const details = getAnalysisDetails(job.rawTranscript ? job.aiAnalysisPass : '');
+      if (details.dealRiskScore !== dealRiskFilter) {
+        return false;
+      }
+    }
     if (searchQuery.trim() !== '') {
       const query = searchQuery.toLowerCase();
       const matchCallId = job.callId.toLowerCase().includes(query);
@@ -295,7 +324,8 @@ export default function LiveIngestionStream() {
           'Content-Type': 'application/json',
           'x-gemini-key': customApiKey,
           'x-ai-provider': apiProvider,
-          'x-model-name': modelName
+          'x-model-name': modelName,
+          'x-slack-webhook-url': slackWebhookUrl
         },
         body: JSON.stringify({ callId: finalCallId, rawTranscript: simTranscript }),
       });
@@ -399,6 +429,7 @@ export default function LiveIngestionStream() {
     localStorage.setItem('gtm_custom_api_key', customApiKey);
     localStorage.setItem('gtm_api_provider', apiProvider);
     localStorage.setItem('gtm_model_name', modelName);
+    localStorage.setItem('gtm_slack_webhook_url', slackWebhookUrl);
     setShowSettingsModal(false);
   };
 
@@ -506,8 +537,52 @@ Enterprise Growth Coordinator`;
     }
   };
 
-  const generateFollowUpEmail = (job: JobDetail) => {
-    return getAnalysisDetails(job.aiAnalysisPass).emailDraft;
+  const applyEmailTone = (emailText: string, tone: 'Formal' | 'Casual' | 'Urgent' | 'Value-Led') => {
+    if (!emailText) return '';
+    
+    // Clean subject and body separation if present
+    let subject = 'Following up on our sync - GTM Alignment & Next Steps';
+    let body = emailText;
+    
+    const subjectMatch = emailText.match(/^Subject:\s*(.*)/i);
+    if (subjectMatch) {
+      subject = subjectMatch[1];
+      body = emailText.replace(/^Subject:.*\n*/i, '').trim();
+    }
+    
+    if (tone === 'Formal') {
+      subject = `[Formal Follow-Up] ${subject}`;
+      body = body
+        .replace(/^(Hi|Hey|Hello)(.*),/i, 'Dear $2,')
+        .replace(/Thank you for taking the time to sync with us today\./gi, 'I would like to express my sincere appreciation for your time during our discussion today.')
+        .replace(/I am following up on our discussion/gi, 'I am writing to formally follow up on our constructive conversation')
+        .replace(/Do you have 10 minutes next Tuesday to review/gi, 'Would it be convenient for you to schedule a brief 10-minute review next Tuesday to evaluate')
+        .replace(/Best regards/gi, 'Sincerely')
+        .replace(/Enterprise Growth Coordinator/gi, 'Enterprise Growth Coordinator\nAcme Corp. Enterprise Solutions');
+    } else if (tone === 'Casual') {
+      subject = `👋 Quick follow up: ${subject.replace(/following up on our sync - /i, '')}`;
+      body = body
+        .replace(/^(Hi|Hey|Hello|Dear)(.*),/i, 'Hey $2! 👋')
+        .replace(/Thank you for taking the time to sync with us today\./gi, 'Great chatting with you earlier today!')
+        .replace(/I am following up on our discussion/gi, 'Just wanted to shoot you a quick note to sync up')
+        .replace(/Do you have 10 minutes next Tuesday to review/gi, 'Got 10 mins next Tuesday to check out')
+        .replace(/Best regards/gi, 'Cheers')
+        .replace(/Enterprise Growth Coordinator/gi, 'Growth team');
+    } else if (tone === 'Urgent') {
+      subject = `⚠️ URGENT ACTION REQUIRED: ${subject}`;
+      body = body
+        .replace(/^(Hi|Hey|Hello|Dear)(.*),/i, 'Hi $2,')
+        .replace(/Thank you for taking the time to sync with us today\./gi, 'Following up urgently from our conversation today.')
+        .replace(/Do you have 10 minutes next Tuesday to review/gi, 'We need to align as soon as possible. Can we connect next Tuesday at the absolute latest to review')
+        .replace(/Best regards/gi, 'Respectfully');
+    }
+    
+    return `Subject: ${subject}\n\n${body}`;
+  };
+
+  const generateFollowUpEmail = (job: JobDetail, tone: 'Formal' | 'Casual' | 'Urgent' | 'Value-Led' = 'Value-Led') => {
+    const rawEmail = getAnalysisDetails(job.aiAnalysisPass).emailDraft;
+    return applyEmailTone(rawEmail, tone);
   };
 
   const downloadSummaryMarkdown = (job: JobDetail) => {
@@ -674,24 +749,49 @@ Generated by GTM Context Engine.`;
         </div>
 
         <div className="p-4 border-b border-[#1F2229] bg-[#12141A] flex flex-col md:flex-row gap-4 justify-between items-center">
-          <div className="flex gap-2">
-            {(['ALL', 'PROCESSING', 'COMPLETED', 'FAULTED'] as const).map((status) => {
-              const isActive = statusFilter === status;
-              return (
-                <button
-                  key={status}
-                  type="button"
-                  onClick={() => setStatusFilter(status)}
-                  className={`px-3 py-1.5 text-xs font-mono tracking-wider font-semibold border rounded-sm transition-colors uppercase cursor-pointer ${
-                    isActive
-                      ? 'bg-indigo-600 text-white border-indigo-500'
-                      : 'bg-[#0E1015] text-[#737885] border-[#1F2229] hover:bg-[#161920] hover:text-white'
-                  }`}
-                >
-                  {status}
-                </button>
-              );
-            })}
+          <div className="flex flex-wrap gap-4 items-center">
+            <div className="flex gap-2">
+              {(['ALL', 'PROCESSING', 'COMPLETED', 'FAULTED'] as const).map((status) => {
+                const isActive = statusFilter === status;
+                return (
+                  <button
+                    key={status}
+                    type="button"
+                    onClick={() => setStatusFilter(status)}
+                    className={`px-3 py-1.5 text-[10px] font-mono tracking-wider font-semibold border rounded-sm transition-colors uppercase cursor-pointer ${
+                      isActive
+                        ? 'bg-indigo-600 text-white border-indigo-500'
+                        : 'bg-[#0E1015] text-[#737885] border-[#1F2229] hover:bg-[#161920] hover:text-white'
+                    }`}
+                  >
+                    {status}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="h-6 w-[1px] bg-[#1F2229] hidden sm:block" />
+
+            <div className="flex gap-2 items-center">
+              <span className="text-[10px] font-mono tracking-wider uppercase text-[#737885] font-bold">Risk:</span>
+              {(['ALL', 'Low', 'Medium', 'High'] as const).map((risk) => {
+                const isActive = dealRiskFilter === risk;
+                return (
+                  <button
+                    key={risk}
+                    type="button"
+                    onClick={() => setDealRiskFilter(risk)}
+                    className={`px-2.5 py-1 text-[10px] font-mono tracking-wider font-semibold border rounded-sm transition-colors uppercase cursor-pointer ${
+                      isActive
+                        ? 'bg-indigo-600 text-white border-indigo-500'
+                        : 'bg-[#0E1015] text-[#737885] border-[#1F2229] hover:bg-[#161920] hover:text-white'
+                    }`}
+                  >
+                    {risk === 'Low' ? '🟢 Low' : risk === 'Medium' ? '🟡 Med' : risk === 'High' ? '🔴 High' : 'ALL'}
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           <div className="w-full md:w-80 relative">
@@ -779,6 +879,18 @@ Generated by GTM Context Engine.`;
                   className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
                 />
                 <p className="mt-1 text-[10px] text-[#4F535E]">Your API key is stored safely on this browser client only.</p>
+              </div>
+
+              <div>
+                <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Slack Outbound Webhook URL</label>
+                <input
+                  type="text"
+                  placeholder="https://hooks.slack.com/services/..."
+                  value={slackWebhookUrl}
+                  onChange={(e) => setSlackWebhookUrl(e.target.value)}
+                  className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-2 text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
+                />
+                <p className="mt-1 text-[10px] text-[#4F535E]">The pipeline will post real-time Block Kit notifications to this channel.</p>
               </div>
 
               <div>
@@ -947,7 +1059,25 @@ Generated by GTM Context Engine.`;
                     />
                   </div>
                   <div>
-                    <label className="block text-[#737885] uppercase tracking-wider mb-1.5 font-bold">Raw Transcript Stream Text</label>
+                    <div className="flex justify-between items-center mb-1.5">
+                      <label className="block text-[#737885] uppercase tracking-wider font-bold">Raw Transcript Stream Text</label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSimCallId('call_snowflake_migration_' + Math.floor(Math.random() * 900 + 100));
+                          setSimTranscript(
+                            "Mark: Thanks for jumping on, Sarah. We are reviewing our data warehouse budget. We currently pay Snowflake $50,000/yr.\n" +
+                            "Sarah: Understood, Mark. If you migrate to GTM Context Engine, we can offer a 2-year contract at $35,000/yr.\n" +
+                            "Mark: That sounds like a solid 30% discount. What about security? We need your ISO 27001 certs.\n" +
+                            "Sarah: Alex from our security team will send the ISO 27001 certifications directly to Rachel on your team by tomorrow.\n" +
+                            "Mark: Great. Let's review the TCO mapping next Tuesday."
+                          );
+                        }}
+                        className="text-[10px] text-indigo-400 hover:text-indigo-300 font-bold uppercase tracking-wider border border-indigo-800/40 px-2 py-0.5 rounded-sm bg-indigo-950/20 transition-colors"
+                      >
+                        💡 Load Enterprise Sample
+                      </button>
+                    </div>
                     <textarea
                       placeholder="Paste structural client meeting logs or conversations directly..."
                       value={simTranscript}
@@ -1094,7 +1224,7 @@ Generated by GTM Context Engine.`;
               <div className="flex flex-col gap-2">
                 <div className="flex gap-2">
                   <button
-                    onClick={() => handleCopyEmail(generateFollowUpEmail(jobDetail))}
+                    onClick={() => handleCopyEmail(generateFollowUpEmail(jobDetail, selectedTone))}
                     className="flex-1 bg-indigo-950/40 hover:bg-indigo-900/60 text-indigo-400 border border-indigo-800/60 font-semibold py-1.5 rounded-sm uppercase tracking-wide transition-colors text-center cursor-pointer text-[10px]"
                   >
                     {copied ? '📋 Copied!' : '📋 Copy Email'}
@@ -1194,9 +1324,30 @@ Generated by GTM Context Engine.`;
               </div>
 
               <div>
-                <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Personalized Follow-up Email Draft:</span>
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-[#737885] font-bold uppercase tracking-wider">Personalized Follow-up Email Draft:</span>
+                  <div className="flex gap-1">
+                    {(['Value-Led', 'Formal', 'Casual', 'Urgent'] as const).map((tone) => {
+                      const isActive = selectedTone === tone;
+                      return (
+                        <button
+                          key={tone}
+                          type="button"
+                          onClick={() => setSelectedTone(tone)}
+                          className={`px-1.5 py-0.5 text-[9px] font-mono tracking-wider border rounded-sm transition-colors uppercase cursor-pointer ${
+                            isActive
+                              ? 'bg-indigo-600 text-white border-indigo-500 font-bold'
+                              : 'bg-[#0E1015] text-[#737885] border-[#1F2229] hover:bg-[#161920] hover:text-white'
+                          }`}
+                        >
+                          {tone}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
                 <pre className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm p-4 text-slate-300 whitespace-pre-wrap font-sans text-xs leading-relaxed overflow-x-auto select-all">
-                  {getAnalysisDetails(jobDetail.aiAnalysisPass).emailDraft}
+                  {generateFollowUpEmail(jobDetail, selectedTone)}
                 </pre>
               </div>
 
@@ -1204,6 +1355,49 @@ Generated by GTM Context Engine.`;
           )}
         </div>
       </div>
+      {/* Real-time Slack alert desktop notification simulation toasts */}
+      <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-3 max-w-sm w-full">
+        {slackToasts.map((toast) => (
+          <div 
+            key={toast.id}
+            style={{
+              animation: 'slideIn 0.3s ease-out forwards',
+            }}
+            className="bg-[#0F1115] border-l-4 border-indigo-500 border border-[#1F2229] shadow-2xl p-4 rounded-[#040405] font-mono text-xs text-[#E4E6EB] relative overflow-hidden group"
+          >
+            <button 
+              type="button"
+              className="absolute top-1 right-2.5 opacity-50 hover:opacity-100 cursor-pointer text-[#737885] bg-transparent border-0 font-mono text-sm"
+              onClick={() => setSlackToasts(prev => prev.filter(t => t.id !== toast.id))}
+            >
+              ×
+            </button>
+            <div className="flex items-start gap-3">
+              <span className="text-lg">💬</span>
+              <div className="space-y-1">
+                <span className="text-[10px] text-indigo-400 font-bold uppercase tracking-widest block">Slack Webhook Alert</span>
+                <span className="text-white font-bold block">Deal Risk Resolved: {toast.risk === 'High' ? '🔴 High Risk' : '🟡 Medium Risk'}</span>
+                <p className="text-[10px] text-[#737885] leading-normal">
+                  Transaction Key <span className="text-zinc-300 font-semibold">{toast.callId}</span> has finished pipeline execution and has been pushed to active integrations.
+                </p>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <style dangerouslySetInnerHTML={{ __html: `
+        @keyframes slideIn {
+          from {
+            transform: translateX(120%);
+            opacity: 0;
+          }
+          to {
+            transform: translateX(0);
+            opacity: 1;
+          }
+        }
+      `}} />
     </div>
   );
 }

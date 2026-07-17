@@ -171,6 +171,7 @@ fastify.post('/api/v1/webhooks/gong', {
   const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'];
   const provider = request.headers['x-ai-provider'];
   const modelName = request.headers['x-model-name'];
+  const slackWebhookUrl = request.headers['x-slack-webhook-url'];
 
   try {
     // 1. Instantly stage basic execution frame to PostgreSQL via Prisma using upsert
@@ -197,7 +198,8 @@ fastify.post('/api/v1/webhooks/gong', {
       transcript: rawTranscript,
       geminiKey: geminiKey,
       provider: provider,
-      modelName: modelName
+      modelName: modelName,
+      slackWebhookUrl: slackWebhookUrl
     }, {
       attempts: 3,
       backoff: {
@@ -239,6 +241,7 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
     const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'];
     const provider = request.headers['x-ai-provider'];
     const modelName = request.headers['x-model-name'];
+    const slackWebhookUrl = request.headers['x-slack-webhook-url'];
 
     // Reset status to PROCESSING, reset outboundTriggered and aiAnalysisPass
     const updatedRecord = await prisma.callSummary.update({
@@ -256,7 +259,8 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
       transcript: job.rawTranscript,
       geminiKey: geminiKey,
       provider: provider,
-      modelName: modelName
+      modelName: modelName,
+      slackWebhookUrl: slackWebhookUrl
     }, {
       attempts: 3,
       backoff: {
