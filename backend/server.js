@@ -169,6 +169,8 @@ fastify.post('/api/v1/webhooks/gong', {
 }, async (request, reply) => {
   const { callId, rawTranscript } = request.body;
   const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'];
+  const provider = request.headers['x-ai-provider'];
+  const modelName = request.headers['x-model-name'];
 
   try {
     // 1. Instantly stage basic execution frame to PostgreSQL via Prisma using upsert
@@ -193,7 +195,9 @@ fastify.post('/api/v1/webhooks/gong', {
     await transcriptQueue.add('process-gong-raw', {
       callId: callId,
       transcript: rawTranscript,
-      geminiKey: geminiKey
+      geminiKey: geminiKey,
+      provider: provider,
+      modelName: modelName
     }, {
       attempts: 3,
       backoff: {
@@ -233,6 +237,8 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
     }
 
     const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'];
+    const provider = request.headers['x-ai-provider'];
+    const modelName = request.headers['x-model-name'];
 
     // Reset status to PROCESSING, reset outboundTriggered and aiAnalysisPass
     const updatedRecord = await prisma.callSummary.update({
@@ -248,7 +254,9 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
     await transcriptQueue.add('process-gong-raw', {
       callId: job.callId,
       transcript: job.rawTranscript,
-      geminiKey: geminiKey
+      geminiKey: geminiKey,
+      provider: provider,
+      modelName: modelName
     }, {
       attempts: 3,
       backoff: {

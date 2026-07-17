@@ -31,19 +31,15 @@ const transcriptWorker = new Worker(
     const callId = job.data.callId;
     const transcript = job.data.transcriptData || job.data.transcript;
     const apiKey = job.data.geminiKey || process.env.GEMINI_API_KEY;
-    const ai = new GoogleGenAI({ apiKey });
+    const provider = job.data.provider || (apiKey?.startsWith('sk-or-') ? 'openrouter' : 'gemini');
+    const modelName = job.data.modelName || (provider === 'openrouter' ? 'anthropic/claude-3.5-sonnet' : 'gemini-2.5-flash');
 
     if (!transcript) {
       logger.warn({ jobId: job.id, callId }, 'No transcript string text found in job payload keys!');
       throw new Error('No transcript data available');
     }
-    logger.info({ jobId: job.id, callId }, 'Sending raw transcript payload to Gemini...');
 
-    try {
-      // 1. Run analysis generation using Gemini
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `Analyze the following meeting transcript and provide a structured summary including key decisions and high-priority action items with owners.
+    const promptText = `Analyze the following meeting transcript and provide a structured summary including key decisions and high-priority action items with owners.
         
         At the end of your response, add a section marked exactly with "### Follow-up Email Draft" (on a new line). In this section, write a highly personalized, ready-to-send follow-up email draft based on the meeting.
         
@@ -53,11 +49,60 @@ const transcriptWorker = new Worker(
         - References the exact next steps and who owes what (e.g. Alex sending the ISO 27001 certs to Rachel).
         
         Transcript:
-        ${transcript}`
-      });
+        ${transcript}`;
 
-      const analysisText = response.text;
-      logger.info({ jobId: job.id, callId }, 'Gemini successfully processed the payload!');
+    const isOpenRouter = (apiKey && apiKey.startsWith('sk-or-')) || provider === 'openrouter';
+
+    try {
+      let analysisText = '';
+
+      if (isOpenRouter) {
+        logger.info({ jobId: job.id, callId, modelName }, 'Routing prompt via OpenRouter...');
+        if (!apiKey) {
+          throw new Error('API_KEY_MISSING: OpenRouter key not configured.');
+        }
+
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'HTTP-Referer': 'http://localhost:3000',
+            'X-Title': 'GTM Context Engine'
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages: [
+              {
+                role: 'user',
+                content: promptText
+              }
+            ]
+          })
+        });
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          const errMsg = errData?.error?.message || `HTTP error ${response.status}`;
+          throw new Error(`OPENROUTER_ERROR: ${errMsg}`);
+        }
+
+        const data = await response.json();
+        analysisText = data?.choices?.[0]?.message?.content;
+        if (!analysisText) {
+          throw new Error('OPENROUTER_ERROR: Received empty chat completions response.');
+        }
+      } else {
+        logger.info({ jobId: job.id, callId, modelName }, 'Sending raw transcript payload to Gemini...');
+        const ai = new GoogleGenAI({ apiKey });
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: promptText
+        });
+        analysisText = response.text;
+      }
+
+      logger.info({ jobId: job.id, callId }, 'LLM successfully processed the payload!');
 
       // 2. Write analysis data to database storage using Prisma (Assigned to 'record' variable)
       logger.info({ jobId: job.id, callId }, 'Updating analysis data in database storage...');
@@ -90,13 +135,35 @@ const transcriptWorker = new Worker(
       
     } catch (error) {
       logger.error({ jobId: job.id, callId, error: error.message, stack: error.stack }, 'AI/Database Layer Faulted');
+      
+      let statusToSet = 'FAULTED';
+      const errMsg = error.message.toLowerCase();
+      
+      if (
+        errMsg.includes('api_key_invalid') ||
+        errMsg.includes('api key not valid') ||
+        errMsg.includes('invalid api key') ||
+        errMsg.includes('invalid key') ||
+        errMsg.includes('unauthorized') ||
+        errMsg.includes('401') ||
+        errMsg.includes('403') ||
+        errMsg.includes('invalid_api_key') ||
+        errMsg.includes('key_missing') ||
+        errMsg.includes('missing api key')
+      ) {
+        statusToSet = 'INVALID_API_KEY';
+      }
+
       try {
         await prisma.callSummary.update({
           where: { callId: callId },
-          data: { status: 'FAULTED' }
+          data: { 
+            status: statusToSet,
+            aiAnalysisPass: `API_ERROR: ${error.message}`
+          }
         });
       } catch (dbErr) {
-        logger.error({ dbErr: dbErr.message }, 'Could not update job status to FAULTED');
+        logger.error({ dbErr: dbErr.message }, 'Could not update job status in database');
       }
       throw error; // Re-throw so BullMQ handles retry logging accurately
     }
