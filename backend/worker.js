@@ -4,8 +4,11 @@ import IORedis from 'ioredis';
 import { GoogleGenAI } from '@google/genai';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
+import pino from 'pino';
 
-console.log('🔄 Background Worker Engine Initializing with AI Core...');
+const logger = pino();
+
+logger.info('🔄 Background Worker Engine Initializing with AI Core...');
 
 // Initialize the Google Gen AI client library instance
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -16,8 +19,8 @@ const prisma = new PrismaClient({ adapter });
 
 // Configure a dedicated connection manager to link cleanly with our Docker Redis service
 const redisConnection = new IORedis({
-  host: '127.0.0.1',
-  port: 6379,
+  host: process.env.REDIS_HOST || '127.0.0.1',
+  port: parseInt(process.env.REDIS_PORT || '6379', 10),
   maxRetriesPerRequest: null // This flag is strictly required by BullMQ framework architectural standards
 });
 
@@ -30,10 +33,10 @@ const transcriptWorker = new Worker(
     const transcript = job.data.transcriptData || job.data.transcript;
 
     if (!transcript) {
-      console.error(`⚠️ [Job #${job.id}] Warning: No transcript string text found in job payload keys!`);
+      logger.warn({ jobId: job.id, callId }, 'No transcript string text found in job payload keys!');
       throw new Error('No transcript data available');
     }
-    console.log(`\n📦 [Job #${job.id}] Sending raw transcript payload to Gemini...`);
+    logger.info({ jobId: job.id, callId }, 'Sending raw transcript payload to Gemini...');
 
     try {
       // 1. Run analysis generation using Gemini
@@ -43,13 +46,10 @@ const transcriptWorker = new Worker(
       });
 
       const analysisText = response.text;
-      console.log(`✨ [Job #${job.id}] Gemini successfully processed the payload!`);
-      console.log('--- AI ANALYSIS REPORT ---');
-      console.log(analysisText);
-      console.log('--------------------------');
+      logger.info({ jobId: job.id, callId }, 'Gemini successfully processed the payload!');
 
       // 2. Write analysis data to database storage using Prisma (Assigned to 'record' variable)
-      console.log(`💾 [Job #${job.id}] Updating analysis data in database storage...`);
+      logger.info({ jobId: job.id, callId }, 'Updating analysis data in database storage...');
       const record = await prisma.callSummary.upsert({
         where: { callId: callId },
         update: {
@@ -64,7 +64,7 @@ const transcriptWorker = new Worker(
         }
       });
 
-      console.log(`✅ [Job #${job.id}] Successfully saved to database table!`); 
+      logger.info({ jobId: job.id, callId }, 'Successfully saved to database table!'); 
 
       // 3. Pass payload seamlessly to the outbound automated link
       const triggered = await dispatchToOutboundPipeline(callId, analysisText);
@@ -74,18 +74,18 @@ const transcriptWorker = new Worker(
           where: { id: record.id },
           data: { outboundTriggered: true }
         });
-        console.log(`🔄 [Job #${job.id}] Updated call summary status: outboundTriggered = true.`);
+        logger.info({ jobId: job.id, callId }, 'Updated call summary status: outboundTriggered = true.');
       }
       
     } catch (error) {
-      console.error(`❌ [Job #${job.id}] AI/Database Layer Faulted:`, error.message);
+      logger.error({ jobId: job.id, callId, error: error.message, stack: error.stack }, 'AI/Database Layer Faulted');
       try {
         await prisma.callSummary.update({
           where: { callId: callId },
           data: { status: 'FAULTED' }
         });
       } catch (dbErr) {
-        console.error(`⚠️ Could not update job status to FAULTED:`, dbErr.message);
+        logger.error({ dbErr: dbErr.message }, 'Could not update job status to FAULTED');
       }
       throw error; // Re-throw so BullMQ handles retry logging accurately
     }
@@ -93,9 +93,66 @@ const transcriptWorker = new Worker(
   { connection: redisConnection }
 );
 
-console.log('🚀 Background Worker Engine actively listening for queue assignments.');
+logger.info('🚀 Background Worker Engine actively listening for queue assignments.');
 
 // Global process exception handlers to monitor connection stability safely
 transcriptWorker.on('failed', (job, err) => {
-  console.error(`❌ [Job #${job.id}] Failed completely:`, err.message);
+  const attempts = job?.opts?.attempts || 1;
+  const attemptsMade = job?.attemptsMade || 0;
+  
+  if (attemptsMade >= attempts) {
+    logger.error({
+      event: 'job_failed_permanently',
+      jobId: job?.id,
+      callId: job?.data?.callId,
+      error: err.message,
+      stack: err.stack,
+      attemptsMade,
+      attempts
+    }, `❌ [Job #${job?.id}] Failed permanently after ${attemptsMade} attempts.`);
+  } else {
+    logger.warn({
+      event: 'job_attempt_failed',
+      jobId: job?.id,
+      callId: job?.data?.callId,
+      error: err.message,
+      attemptsMade,
+      attempts
+    }, `⚠️ [Job #${job?.id}] Attempt ${attemptsMade} failed. Retrying...`);
+  }
 });
+
+// Graceful Shutdown Logic
+async function gracefulShutdown(signal) {
+  logger.info({ signal }, `Starting graceful shutdown of worker...`);
+
+  // 1. Close BullMQ worker
+  try {
+    await transcriptWorker.close();
+    logger.info('BullMQ worker closed.');
+  } catch (err) {
+    logger.error({ err: err.message }, 'Error closing worker');
+  }
+
+  // 2. Disconnect Prisma
+  try {
+    await prisma.$disconnect();
+    logger.info('Prisma database client disconnected.');
+  } catch (err) {
+    logger.error({ err: err.message }, 'Error disconnecting Prisma');
+  }
+
+  // 3. Quit Redis connection
+  try {
+    await redisConnection.quit();
+    logger.info('Redis connection ended.');
+  } catch (err) {
+    logger.error({ err: err.message }, 'Error closing Redis connection');
+  }
+
+  logger.info('Graceful shutdown complete. Exiting.');
+  process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

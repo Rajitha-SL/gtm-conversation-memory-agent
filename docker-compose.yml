@@ -13,6 +13,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gtm_admin -d gtm_memory_engine"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   queue_broker:
     image: redis:7-alpine
@@ -20,6 +25,64 @@ services:
     ports:
       - "6379:6379"
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gtm_backend_api
+    command: node server.js
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://gtm_admin:admin_secure_pass123@database:5432/gtm_memory_engine?schema=public
+      REDIS_HOST: queue_broker
+      REDIS_PORT: 6379
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    restart: always
+    depends_on:
+      database:
+        condition: service_healthy
+      queue_broker:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gtm_worker
+    command: node worker.js
+    environment:
+      DATABASE_URL: postgresql://gtm_admin:admin_secure_pass123@database:5432/gtm_memory_engine?schema=public
+      REDIS_HOST: queue_broker
+      REDIS_PORT: 6379
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    restart: always
+    depends_on:
+      database:
+        condition: service_healthy
+      queue_broker:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gtm_frontend
+    ports:
+      - "3001:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3000
+      PORT: 3000
+    restart: always
+    depends_on:
+      backend:
+        condition: service_started
 
 volumes:
   postgres_data:

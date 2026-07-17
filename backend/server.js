@@ -5,6 +5,7 @@ import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
+import fastifyRateLimit from '@fastify/rate-limit';
 
 // Initialize Fastify framework instance
 const fastify = Fastify({
@@ -23,8 +24,8 @@ const prisma = new PrismaClient({
 
 // 3. Initialize BullMQ Queue for background workers
 const redisConnection = new IORedis({
-  host: '127.0.0.1',
-  port: 6379,
+  host: process.env.REDIS_HOST || '127.0.0.1',
+  port: parseInt(process.env.REDIS_PORT || '6379', 10),
   maxRetriesPerRequest: null
 });
 
@@ -44,6 +45,9 @@ await fastify.register(fastifyCors, {
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type']
 });
+
+// Register Rate Limit plugin globally
+await fastify.register(fastifyRateLimit);
 
 /**
  * -----------------------------------------------------------------------------
@@ -130,53 +134,71 @@ fastify.get('/api/v1/jobs/stream', (request, reply) => {
   reply.raw.write('retry: 10000\n\n');
   clients.add(reply.raw);
   
-  console.log(`SSE Client connected. Total clients: ${clients.size}`);
+  fastify.log.info({ clientsCount: clients.size }, 'SSE Client connected.');
 
   const keepAlive = setInterval(() => {
-    reply.raw.write(': keep-alive\n\n');
+    reply.raw.write(': ping\n\n');
   }, 15000);
 
   request.raw.on('close', () => {
     clearInterval(keepAlive);
     clients.delete(reply.raw);
-    console.log(`SSE Client disconnected. Total clients: ${clients.size}`);
+    fastify.log.info({ clientsCount: clients.size }, 'SSE Client disconnected.');
   });
 });
 
-// 4. POST Webhook Data Ingestion Route (Receives data stream & triggers BullMQ background handoff)
-fastify.post('/api/v1/webhooks/gong', async (request, reply) => {
-  const { callId, transcript } = request.body;
-
-  if (!callId || !transcript) {
-    return reply.status(400).send({
-      status: 'REJECTED',
-      message: 'MALFORMED PAYLOAD: Both callId and transcript parameters are mandatory.'
-    });
+const gongSchema = {
+  body: {
+    type: 'object',
+    required: ['callId', 'rawTranscript'],
+    properties: {
+      callId: { type: 'string', minLength: 1 },
+      rawTranscript: { type: 'string', minLength: 1 }
+    }
   }
+};
+
+// 4. POST Webhook Data Ingestion Route (Receives data stream & triggers BullMQ background handoff)
+fastify.post('/api/v1/webhooks/gong', {
+  config: {
+    rateLimit: {
+      max: 10,
+      timeWindow: '1 minute'
+    }
+  },
+  schema: gongSchema
+}, async (request, reply) => {
+  const { callId, rawTranscript } = request.body;
 
   try {
     // 1. Instantly stage basic execution frame to PostgreSQL via Prisma using upsert
     const newRecord = await prisma.callSummary.upsert({
       where: { callId: callId },
       update: {
-        rawTranscript: transcript,
+        rawTranscript: rawTranscript,
         status: 'PROCESSING',
         outboundTriggered: false,
         aiAnalysisPass: ''
       },
       create: {
         callId: callId,
-        rawTranscript: transcript,
+        rawTranscript: rawTranscript,
         status: 'PROCESSING',
         outboundTriggered: false,
         aiAnalysisPass: ''
       }
     });
 
-    // 2. Handoff transaction to our background background queue worker node via Redis
+    // 2. Handoff transaction to our background background queue worker node via Redis with retry configuration
     await transcriptQueue.add('process-gong-raw', {
       callId: callId,
-      transcript: transcript
+      transcript: rawTranscript
+    }, {
+      attempts: 3,
+      backoff: {
+        type: 'exponential',
+        delay: 2000
+      }
     });
 
     return reply.status(202).send({
@@ -219,10 +241,16 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
       }
     });
 
-    // Re-enqueue transaction to BullMQ background worker queue via Redis
+    // Re-enqueue transaction to BullMQ background worker queue via Redis with retry configuration
     await transcriptQueue.add('process-gong-raw', {
       callId: job.callId,
       transcript: job.rawTranscript
+    }, {
+      attempts: 3,
+      backoff: {
+        type: 'exponential',
+        delay: 2000
+      }
     });
 
     return reply.status(200).send({
@@ -247,7 +275,7 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
 async function setupPostgresListener() {
   try {
     await listenClient.connect();
-    console.log('🔌 Connected dedicated pg client for LISTEN/NOTIFY');
+    fastify.log.info('🔌 Connected dedicated pg client for LISTEN/NOTIFY');
     
     // Setup database triggers dynamically
     await listenClient.query(`
@@ -276,14 +304,14 @@ async function setupPostgresListener() {
       EXECUTE FUNCTION notify_job_change();
     `);
     
-    console.log('✅ PostgreSQL trigger and trigger function configured.');
+    fastify.log.info('✅ PostgreSQL trigger and trigger function configured.');
 
     await listenClient.query('LISTEN jobs_channel');
-    console.log('👂 Listening to jobs_channel...');
+    fastify.log.info('👂 Listening to jobs_channel...');
 
     listenClient.on('notification', async (msg) => {
       if (msg.channel === 'jobs_channel' && msg.payload) {
-        console.log('🔔 Received PG notify:', msg.payload);
+        fastify.log.info({ payload: msg.payload }, '🔔 Received PG notify');
         try {
           const minimalData = JSON.parse(msg.payload);
           const fullJob = await prisma.callSummary.findUnique({
@@ -305,33 +333,133 @@ async function setupPostgresListener() {
             }
           }
         } catch (err) {
-          console.error('Error fetching full job details for broadcast:', err);
+          fastify.log.error({ err }, 'Error fetching full job details for broadcast');
         }
       }
     });
     
     listenClient.on('error', async (err) => {
-      console.error('❌ Postgres listener client error:', err);
+      fastify.log.error({ err }, '❌ Postgres listener client error');
       try {
         await listenClient.end();
       } catch {}
       setTimeout(setupPostgresListener, 5000);
     });
   } catch (err) {
-    console.error('❌ Failed to setup Postgres listener:', err);
+    fastify.log.error({ err }, '❌ Failed to setup Postgres listener');
     setTimeout(setupPostgresListener, 5000);
   }
 }
 
+// 6. GET Health Check Route (Checks connections and reports BullMQ job status metrics)
+fastify.get('/api/v1/health', async (request, reply) => {
+  let dbStatus = 'UP';
+  let redisStatus = 'UP';
+  let status = 'UP';
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+  } catch (err) {
+    dbStatus = 'DOWN';
+    status = 'DOWN';
+    fastify.log.error({ err }, 'Healthcheck DB connection failure');
+  }
+
+  try {
+    const pong = await redisConnection.ping();
+    if (pong !== 'PONG') {
+      redisStatus = 'DOWN';
+      status = 'DOWN';
+    }
+  } catch (err) {
+    redisStatus = 'DOWN';
+    status = 'DOWN';
+    fastify.log.error({ err }, 'Healthcheck Redis connection failure');
+  }
+
+  let queueMetrics = {};
+  if (redisStatus === 'UP') {
+    try {
+      queueMetrics = await transcriptQueue.getJobCounts();
+    } catch (err) {
+      fastify.log.error({ err }, 'Failed to fetch queue metrics');
+    }
+  }
+
+  return reply.status(200).send({
+    status,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    services: {
+      database: dbStatus,
+      redis: redisStatus
+    },
+    queueMetrics
+  });
+});
+
 const startServer = async () => {
   try {
     await fastify.listen({ port: 3000, host: '0.0.0.0' });
-    console.log('Server is running seamlessly on http://localhost:3000');
+    fastify.log.info('Server is running seamlessly on http://localhost:3000');
     setupPostgresListener();
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
   }
 };
+
+// Graceful Shutdown Logic
+async function gracefulShutdown(signal) {
+  fastify.log.info({ signal }, 'Starting graceful shutdown of server...');
+  
+  // 1. Close all active SSE connections
+  fastify.log.info({ clientsCount: clients.size }, 'Closing active SSE connections...');
+  for (const client of clients) {
+    try {
+      client.write('event: shutdown\ndata: Server is shutting down\n\n');
+      client.end();
+    } catch (e) {}
+  }
+  clients.clear();
+
+  // 2. Close Fastify server
+  try {
+    await fastify.close();
+    fastify.log.info('⚡ Fastify server closed.');
+  } catch (err) {
+    fastify.log.error({ err }, 'Error closing Fastify server');
+  }
+
+  // 3. Close Dedicated Postgres listener
+  try {
+    await listenClient.end();
+    fastify.log.info('🔌 Dedicated PG listener connection ended.');
+  } catch (err) {
+    fastify.log.error({ err }, 'Error closing PG listener');
+  }
+
+  // 4. Disconnect Prisma
+  try {
+    await prisma.$disconnect();
+    fastify.log.info('💾 Prisma database client disconnected.');
+  } catch (err) {
+    fastify.log.error({ err }, 'Error disconnecting Prisma');
+  }
+
+  // 5. Quit Redis connection
+  try {
+    await redisConnection.quit();
+    fastify.log.info('📡 Redis connection ended.');
+  } catch (err) {
+    fastify.log.error({ err }, 'Error closing Redis connection');
+  }
+
+  fastify.log.info('👋 Graceful shutdown complete. Exiting.');
+  process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 startServer();

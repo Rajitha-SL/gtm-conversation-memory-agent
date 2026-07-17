@@ -20,6 +20,16 @@ interface JobDetail {
   createdAt: string;
 }
 
+interface DBJobPayload {
+  id: string;
+  callId: string;
+  status: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAULTED';
+  outboundTriggered: boolean;
+  createdAt: string;
+  rawTranscript?: string;
+  aiAnalysisPass?: string;
+}
+
 export default function LiveIngestionStream() {
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -47,11 +57,11 @@ export default function LiveIngestionStream() {
         }
         const data = await response.json();
         
-        const formattedJobs = data.map((item: any) => ({
+        const formattedJobs = data.map((item: DBJobPayload) => ({
           id: String(item.id), 
           callId: item.callId || 'N/A',
-          geminiStatus: item.status || 'COMPLETED',
-          outboundState: item.outboundTriggered ? 'TRIGGERED' : 'SIMULATED',
+          geminiStatus: (item.status || 'COMPLETED') as IngestionJob['geminiStatus'],
+          outboundState: (item.outboundTriggered ? 'TRIGGERED' : 'SIMULATED') as IngestionJob['outboundState'],
           timestamp: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A',
           rawTranscript: item.rawTranscript || '',
           aiAnalysisPass: item.aiAnalysisPass || ''
@@ -59,8 +69,8 @@ export default function LiveIngestionStream() {
         
         setJobs(formattedJobs);
         setError(null);
-      } catch (err: any) {
-        setError(err.message || 'Failed to establish connection to backend API node.');
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : 'Failed to establish connection to backend API node.');
       } finally {
         setLoading(false);
       }
@@ -82,8 +92,8 @@ export default function LiveIngestionStream() {
         const formattedJob = {
           id: String(updatedJob.id),
           callId: updatedJob.callId || 'N/A',
-          geminiStatus: updatedJob.status || 'COMPLETED',
-          outboundState: updatedJob.outboundTriggered ? 'TRIGGERED' : 'SIMULATED',
+          geminiStatus: (updatedJob.status || 'COMPLETED') as IngestionJob['geminiStatus'],
+          outboundState: (updatedJob.outboundTriggered ? 'TRIGGERED' : 'SIMULATED') as IngestionJob['outboundState'],
           timestamp: updatedJob.createdAt ? new Date(updatedJob.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A',
           rawTranscript: updatedJob.rawTranscript || '',
           aiAnalysisPass: updatedJob.aiAnalysisPass || ''
@@ -129,8 +139,8 @@ export default function LiveIngestionStream() {
       }
       const data = await response.json();
       setJobDetail(data);
-    } catch (err: any) {
-      setDetailError(err.message || 'Could not reach backend lookup gateway.');
+    } catch (err: unknown) {
+      setDetailError(err instanceof Error ? err.message : 'Could not reach backend lookup gateway.');
     } finally {
       setDetailLoading(false);
     }
@@ -152,8 +162,8 @@ export default function LiveIngestionStream() {
         const data = await response.json();
         alert(`Retry failed: ${data.message || 'Unknown error'}`);
       }
-    } catch (err: any) {
-      alert(`Network error: ${err.message || 'Failed to connect to backend'}`);
+    } catch (err: unknown) {
+      alert(`Network error: ${err instanceof Error ? err.message : 'Failed to connect to backend'}`);
     }
   };
 
@@ -185,7 +195,7 @@ export default function LiveIngestionStream() {
       const response = await fetch('http://localhost:3000/api/v1/webhooks/gong', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ callId: simCallId, transcript: simTranscript }),
+        body: JSON.stringify({ callId: simCallId, rawTranscript: simTranscript }),
       });
 
       const data = await response.json();
@@ -197,7 +207,7 @@ export default function LiveIngestionStream() {
       } else {
         setSimStatus({ type: 'error', message: data.message || 'Pipeline ingestion handoff failure.' });
       }
-    } catch (err) {
+    } catch {
       setSimStatus({ type: 'error', message: 'NETWORK REFUSAL: Unable to patch payload into port 3000.' });
     } finally {
       setSimLoading(false);
