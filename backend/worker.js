@@ -39,17 +39,20 @@ const transcriptWorker = new Worker(
       throw new Error('No transcript data available');
     }
 
-    const promptText = `Analyze the following meeting transcript and provide a structured summary including key decisions and high-priority action items with owners.
-        
-        At the end of your response, add a section marked exactly with "### Follow-up Email Draft" (on a new line). In this section, write a highly personalized, ready-to-send follow-up email draft based on the meeting.
-        
-        Ensure this email draft:
-        - Addresses the specific primary contact (e.g. Mark, Sarah) instead of generic placeholders.
-        - Mentions the specific agreed price, discount, or terms (e.g. $36,000/yr for 2 years) discussed in the transcript.
-        - References the exact next steps and who owes what (e.g. Alex sending the ISO 27001 certs to Rachel).
-        
-        Transcript:
-        ${transcript}`;
+    const promptText = `Analyze the following meeting transcript. You must return your response as a valid JSON object matching the following structure:
+    {
+      "summary": "Write a structured executive summary report of the meeting transcript, including Meeting Title, Attendees, Meeting Purpose, Key Decisions, and High-Priority Action Items with owners. Use markdown formatting inside this string.",
+      "dealRiskScore": "Low" or "Medium" or "High",
+      "objectionRiskBreakdown": {
+        "budget": "Assess budget-related risks or blockers discussed in the transcript (or 'None' if not discussed).",
+        "competitor": "Assess competitor-related risks or blockers discussed (or 'None' if not discussed).",
+        "security": "Assess security-related risks or blockers discussed (or 'None' if not discussed)."
+      },
+      "followUpEmail": "Write a highly personalized, ready-to-send follow-up email draft addressed to the specific primary contact (e.g. Mark, Sarah) instead of placeholders. Explicitly mention the specific agreed price, discount, or terms (e.g. $36,000/yr for 2 years) and reference the exact next steps and who owes what (e.g. Alex sending ISO 27001 certs to Rachel)."
+    }
+    
+    Transcript:
+    ${transcript}`;
 
     const isOpenRouter = (apiKey && apiKey.startsWith('sk-or-')) || provider === 'openrouter';
 
@@ -72,6 +75,7 @@ const transcriptWorker = new Worker(
           },
           body: JSON.stringify({
             model: modelName,
+            response_format: { type: 'json_object' },
             messages: [
               {
                 role: 'user',
@@ -97,25 +101,33 @@ const transcriptWorker = new Worker(
         const ai = new GoogleGenAI({ apiKey });
         const response = await ai.models.generateContent({
           model: modelName,
-          contents: promptText
+          contents: promptText,
+          config: {
+            responseMimeType: 'application/json'
+          }
         });
         analysisText = response.text;
       }
 
       logger.info({ jobId: job.id, callId }, 'LLM successfully processed the payload!');
 
+      let cleanAnalysis = analysisText.trim();
+      if (cleanAnalysis.startsWith('```')) {
+        cleanAnalysis = cleanAnalysis.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();
+      }
+
       // 2. Write analysis data to database storage using Prisma (Assigned to 'record' variable)
       logger.info({ jobId: job.id, callId }, 'Updating analysis data in database storage...');
       const record = await prisma.callSummary.upsert({
         where: { callId: callId },
         update: {
-          aiAnalysisPass: analysisText,
+          aiAnalysisPass: cleanAnalysis,
           status: 'COMPLETED'
         },
         create: {
           callId: callId,
           rawTranscript: transcript,
-          aiAnalysisPass: analysisText,
+          aiAnalysisPass: cleanAnalysis,
           status: 'COMPLETED'
         }
       });
@@ -123,7 +135,7 @@ const transcriptWorker = new Worker(
       logger.info({ jobId: job.id, callId }, 'Successfully saved to database table!'); 
 
       // 3. Pass payload seamlessly to the outbound automated link
-      const triggered = await dispatchToOutboundPipeline(callId, analysisText, apiKey);
+      const triggered = await dispatchToOutboundPipeline(callId, cleanAnalysis, apiKey);
 
       if (triggered) {
         await prisma.callSummary.update({

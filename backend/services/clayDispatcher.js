@@ -11,6 +11,14 @@ export async function dispatchToOutboundPipeline(callId, analysisText, customApi
   const ai = new GoogleGenAI({ apiKey });
   logger.info({ callId }, '🔗 [Outbound Link] Extracting market target profiles...');
 
+  let meetingSummary = analysisText;
+  try {
+    const parsed = JSON.parse(analysisText);
+    meetingSummary = parsed.summary || analysisText;
+  } catch (e) {
+    // Keep raw analysisText if not valid JSON
+  }
+
   try {
     // 1. Use Gemini to extract highly structured outbound Activation parameters from the summary
     const response = await ai.models.generateContent({
@@ -28,7 +36,7 @@ export async function dispatchToOutboundPipeline(callId, analysisText, customApi
       }
 
       Meeting Summary Data:
-      ${analysisText}`,
+      ${meetingSummary}`,
     });
 
     let cleanText = response.text.trim();
