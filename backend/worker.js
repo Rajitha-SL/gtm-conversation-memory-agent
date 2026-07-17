@@ -43,7 +43,17 @@ const transcriptWorker = new Worker(
       // 1. Run analysis generation using Gemini
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: `Analyze the following meeting transcript and provide a structured summary including key decisions and high-priority action items with owners:\n\n${transcript}`
+        contents: `Analyze the following meeting transcript and provide a structured summary including key decisions and high-priority action items with owners.
+        
+        At the end of your response, add a section marked exactly with "### Follow-up Email Draft" (on a new line). In this section, write a highly personalized, ready-to-send follow-up email draft based on the meeting.
+        
+        Ensure this email draft:
+        - Addresses the specific primary contact (e.g. Mark, Sarah) instead of generic placeholders.
+        - Mentions the specific agreed price, discount, or terms (e.g. $36,000/yr for 2 years) discussed in the transcript.
+        - References the exact next steps and who owes what (e.g. Alex sending the ISO 27001 certs to Rachel).
+        
+        Transcript:
+        ${transcript}`
       });
 
       const analysisText = response.text;
