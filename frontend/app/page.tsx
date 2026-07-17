@@ -8,6 +8,8 @@ interface IngestionJob {
   geminiStatus: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAULTED';
   outboundState: 'PENDING' | 'TRIGGERED' | 'SIMULATED' | 'BLOCKED' | 'SKIPPED';
   timestamp: string;
+  rawTranscript?: string;
+  aiAnalysisPass?: string;
 }
 
 interface JobDetail {
@@ -22,6 +24,9 @@ export default function LiveIngestionStream() {
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'PROCESSING' | 'COMPLETED' | 'FAULTED'>('ALL');
 
   const [simCallId, setSimCallId] = useState('');
   const [simTranscript, setSimTranscript] = useState('');
@@ -47,7 +52,9 @@ export default function LiveIngestionStream() {
           callId: item.callId || 'N/A',
           geminiStatus: item.status || 'COMPLETED',
           outboundState: item.outboundTriggered ? 'TRIGGERED' : 'SIMULATED',
-          timestamp: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A'
+          timestamp: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A',
+          rawTranscript: item.rawTranscript || '',
+          aiAnalysisPass: item.aiAnalysisPass || ''
         }));
         
         setJobs(formattedJobs);
@@ -60,8 +67,53 @@ export default function LiveIngestionStream() {
     }
 
     fetchPipelineData();
-    const interval = setInterval(fetchPipelineData, 3000);
-    return () => clearInterval(interval);
+
+    // Establish Server-Sent Events (SSE) connection for real-time updates
+    const eventSource = new EventSource('http://localhost:3000/api/v1/jobs/stream');
+
+    eventSource.onopen = () => {
+      console.log('SSE connection successfully opened');
+      setError(null);
+    };
+
+    eventSource.onmessage = (event) => {
+      try {
+        const updatedJob = JSON.parse(event.data);
+        const formattedJob = {
+          id: String(updatedJob.id),
+          callId: updatedJob.callId || 'N/A',
+          geminiStatus: updatedJob.status || 'COMPLETED',
+          outboundState: updatedJob.outboundTriggered ? 'TRIGGERED' : 'SIMULATED',
+          timestamp: updatedJob.createdAt ? new Date(updatedJob.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A',
+          rawTranscript: updatedJob.rawTranscript || '',
+          aiAnalysisPass: updatedJob.aiAnalysisPass || ''
+        };
+
+        setJobs((prevJobs) => {
+          const index = prevJobs.findIndex((j) => j.id === formattedJob.id);
+          if (index !== -1) {
+            // Update existing job in-place
+            const newJobs = [...prevJobs];
+            newJobs[index] = formattedJob;
+            return newJobs;
+          } else {
+            // Prepend new job to the stream
+            return [formattedJob, ...prevJobs];
+          }
+        });
+      } catch (err) {
+        console.error('Error parsing SSE event data:', err);
+      }
+    };
+
+    eventSource.onerror = (err) => {
+      console.error('SSE connection error:', err);
+      setError('Live updates stream connection lost. Attempting to reconnect...');
+    };
+
+    return () => {
+      eventSource.close();
+    };
   }, []);
 
   const handleOpenDetails = async (id: string) => {
@@ -88,6 +140,36 @@ export default function LiveIngestionStream() {
     setSelectedJobId(null);
     setJobDetail(null);
   };
+
+  const handleRetryJob = async (id: string) => {
+    try {
+      const response = await fetch(`http://localhost:3000/api/v1/jobs/${id}/retry`, {
+        method: 'POST',
+      });
+      if (response.ok) {
+        handleCloseDetails();
+      } else {
+        const data = await response.json();
+        alert(`Retry failed: ${data.message || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      alert(`Network error: ${err.message || 'Failed to connect to backend'}`);
+    }
+  };
+
+  const filteredJobs = jobs.filter((job) => {
+    if (statusFilter !== 'ALL' && job.geminiStatus !== statusFilter) {
+      return false;
+    }
+    if (searchQuery.trim() !== '') {
+      const query = searchQuery.toLowerCase();
+      const matchCallId = job.callId.toLowerCase().includes(query);
+      const matchTranscript = (job.rawTranscript || '').toLowerCase().includes(query);
+      const matchAnalysis = (job.aiAnalysisPass || '').toLowerCase().includes(query);
+      return matchCallId || matchTranscript || matchAnalysis;
+    }
+    return true;
+  });
 
   const handlePipelineInjection = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -141,6 +223,13 @@ export default function LiveIngestionStream() {
     );
   };
 
+  // Dynamic stats calculation for Analytics & Aggregates Bar
+  const totalIngested = jobs.length;
+  const activeProcessingCount = jobs.filter((j) => j.geminiStatus === 'PROCESSING').length;
+  const failureFaultedCount = jobs.filter((j) => j.geminiStatus === 'FAULTED').length;
+  const successCompletedCount = jobs.filter((j) => j.geminiStatus === 'COMPLETED').length;
+  const successRatePercentage = totalIngested > 0 ? Math.round((successCompletedCount / totalIngested) * 100) : 100;
+
   return (
     <div className="min-h-screen bg-[#0A0B0D] text-[#E4E6EB] p-8 antialiased selection:bg-indigo-500/30 relative overflow-x-hidden">
       
@@ -156,13 +245,29 @@ export default function LiveIngestionStream() {
         </div>
       </header>
 
-      {/* Metrics Row Grid */}
+      {/* Analytics & Aggregates Bar */}
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
         {[
-          { label: 'Active Queue Consumers', value: '01', sub: 'BullMQ Active Thread' },
-          { label: 'Current Queue Backlog', value: '00', sub: 'Redis Memory Stack' },
-          { label: 'Total Synced Passages', value: loading ? '...' : String(jobs.length), sub: 'PostgreSQL Commits' },
-          { label: 'Outbound Pipelines Tripped', value: loading ? '...' : String(jobs.filter(j => j.outboundState === 'TRIGGERED').length), sub: 'Clay Webhook Injections' }
+          { 
+            label: 'Total Transcripts Ingested', 
+            value: loading ? '...' : String(totalIngested), 
+            sub: 'PostgreSQL Commits' 
+          },
+          { 
+            label: 'Success Rate', 
+            value: loading ? '...' : `${successRatePercentage}%`, 
+            sub: 'Completed Pipelines' 
+          },
+          { 
+            label: 'Active Queue Count', 
+            value: loading ? '...' : String(activeProcessingCount), 
+            sub: 'PROCESSING State' 
+          },
+          { 
+            label: 'Failure Count', 
+            value: loading ? '...' : String(failureFaultedCount), 
+            sub: 'FAULTED Objections' 
+          }
         ].map((metric, idx) => (
           <div key={idx} className="bg-[#12141A] border border-[#1F2229] p-5 rounded-sm">
             <div className="text-xs font-mono tracking-wider text-[#737885] uppercase">{metric.label}</div>
@@ -220,12 +325,63 @@ export default function LiveIngestionStream() {
       {/* Primary Data Matrix Table */}
       <main className="bg-[#12141A] border border-[#1F2229] rounded-sm overflow-hidden">
         <div className="px-6 py-4 border-b border-[#1F2229] flex justify-between items-center bg-[#161920]">
-          <h2 className="text-xs font-mono tracking-widest uppercase text-white font-bold">Live Message Log Stream Matrix</h2>
+          <div className="flex items-center gap-4">
+            <h2 className="text-xs font-mono tracking-widest uppercase text-white font-bold">Live Message Log Stream Matrix</h2>
+            {!loading && (
+              <span className="text-[10px] font-mono px-2 py-0.5 bg-[#1F2229] text-[#737885] rounded-sm">
+                Showing {filteredJobs.length} of {jobs.length}
+              </span>
+            )}
+          </div>
           {error ? (
             <span className="text-[11px] font-mono text-rose-400 animate-pulse">⚠️ Connection Error: {error}</span>
           ) : (
             <span className="text-[11px] font-mono text-emerald-400">● Streaming live database records</span>
           )}
+        </div>
+
+        {/* Search & Filter Controls Bar */}
+        <div className="p-4 border-b border-[#1F2229] bg-[#12141A] flex flex-col md:flex-row gap-4 justify-between items-center">
+          {/* Status Tabs */}
+          <div className="flex gap-2">
+            {(['ALL', 'PROCESSING', 'COMPLETED', 'FAULTED'] as const).map((status) => {
+              const isActive = statusFilter === status;
+              return (
+                <button
+                  key={status}
+                  type="button"
+                  onClick={() => setStatusFilter(status)}
+                  className={`px-3 py-1.5 text-xs font-mono tracking-wider font-semibold border rounded-sm transition-colors uppercase cursor-pointer ${
+                    isActive
+                      ? 'bg-indigo-600 text-white border-indigo-500'
+                      : 'bg-[#0E1015] text-[#737885] border-[#1F2229] hover:bg-[#161920] hover:text-white'
+                  }`}
+                >
+                  {status}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Search Input */}
+          <div className="w-full md:w-80 relative">
+            <input
+              type="text"
+              placeholder="Search callId, transcripts, summaries..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm px-3 py-1.5 text-xs font-mono text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#737885] hover:text-white font-mono text-xs cursor-pointer bg-transparent border-0"
+              >
+                ×
+              </button>
+            )}
+          </div>
         </div>
         
         <div className="overflow-x-auto">
@@ -233,6 +389,8 @@ export default function LiveIngestionStream() {
             <div className="p-12 text-center text-xs font-mono text-[#737885] uppercase tracking-widest">Establishing Pipeline Buffer Context...</div>
           ) : jobs.length === 0 ? (
             <div className="p-12 text-center text-xs font-mono text-[#737885] uppercase tracking-widest">No transaction summaries synced to database yet.</div>
+          ) : filteredJobs.length === 0 ? (
+            <div className="p-12 text-center text-xs font-mono text-[#737885] uppercase tracking-widest">No matching summaries found.</div>
           ) : (
             <table className="w-full text-left border-collapse">
               <thead>
@@ -245,7 +403,7 @@ export default function LiveIngestionStream() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#1F2229]/60 font-mono text-xs">
-                {jobs.map((job) => (
+                {filteredJobs.map((job) => (
                   <tr key={job.id} className="hover:bg-[#161920]/40 transition-colors group">
                     <td className="py-4 px-6">
                       <button 
@@ -308,6 +466,17 @@ export default function LiveIngestionStream() {
                   <span className="text-zinc-400">{new Date(jobDetail.createdAt).toLocaleString()}</span>
                 </div>
               </div>
+
+              {jobDetail.status === 'FAULTED' && (
+                <div className="pt-2">
+                  <button
+                    onClick={() => handleRetryJob(jobDetail.id)}
+                    className="w-full bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 border border-rose-800/60 font-semibold py-2 px-4 rounded-sm font-mono tracking-widest uppercase transition-colors text-center cursor-pointer"
+                  >
+                    🔄 Retry AI Analysis
+                  </button>
+                </div>
+              )}
 
               <div className="pt-2">
                 <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Structured AI Report:</span>

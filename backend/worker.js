@@ -49,12 +49,18 @@ const transcriptWorker = new Worker(
       console.log('--------------------------');
 
       // 2. Write analysis data to database storage using Prisma (Assigned to 'record' variable)
-      console.log(`💾 [Job #${job.id}] Writing analysis data to database storage...`);
-      const record = await prisma.callSummary.create({
-        data: {
+      console.log(`💾 [Job #${job.id}] Updating analysis data in database storage...`);
+      const record = await prisma.callSummary.upsert({
+        where: { callId: callId },
+        update: {
+          aiAnalysisPass: analysisText,
+          status: 'COMPLETED'
+        },
+        create: {
           callId: callId,
           rawTranscript: transcript,
-          aiAnalysisPass: analysisText
+          aiAnalysisPass: analysisText,
+          status: 'COMPLETED'
         }
       });
 
@@ -73,6 +79,14 @@ const transcriptWorker = new Worker(
       
     } catch (error) {
       console.error(`❌ [Job #${job.id}] AI/Database Layer Faulted:`, error.message);
+      try {
+        await prisma.callSummary.update({
+          where: { callId: callId },
+          data: { status: 'FAULTED' }
+        });
+      } catch (dbErr) {
+        console.error(`⚠️ Could not update job status to FAULTED:`, dbErr.message);
+      }
       throw error; // Re-throw so BullMQ handles retry logging accurately
     }
   },

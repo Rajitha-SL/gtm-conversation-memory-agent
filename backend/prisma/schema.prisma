@@ -10,7 +10,8 @@ model CallSummary {
   id              String   @id @default(uuid())
   callId          String   @unique
   rawTranscript   String
-  aiAnalysisPass  String
+  aiAnalysisPass  String   @default("")
+  status          String   @default("PROCESSING")
   outboundTriggered Boolean @default(false) // ✨ Tracks pipeline state
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
