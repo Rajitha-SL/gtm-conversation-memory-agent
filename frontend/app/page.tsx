@@ -462,23 +462,38 @@ export default function LiveIngestionStream() {
       const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       
       let systemStream: MediaStream | null = null;
+      let mixSystemAudio = false;
       try {
         systemStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true
         });
+        if (systemStream && systemStream.getAudioTracks().length > 0) {
+          mixSystemAudio = true;
+        }
       } catch (err) {
-        micStream.getTracks().forEach(track => track.stop());
-        throw err;
+        console.warn("System audio sharing failed or unsupported. Requesting screen share without audio...", err);
+        try {
+          systemStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: false
+          });
+        } catch (innerErr) {
+          micStream.getTracks().forEach(track => track.stop());
+          throw innerErr;
+        }
       }
       
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const micSource = audioCtx.createMediaStreamSource(micStream);
-      const systemSource = audioCtx.createMediaStreamSource(systemStream);
       const destination = audioCtx.createMediaStreamDestination();
       
       micSource.connect(destination);
-      systemSource.connect(destination);
+      
+      if (mixSystemAudio && systemStream) {
+        const systemSource = audioCtx.createMediaStreamSource(systemStream);
+        systemSource.connect(destination);
+      }
       
       const mediaRecorder = new MediaRecorder(destination.stream, { mimeType: 'audio/webm' });
       const chunks: BlobPart[] = [];
