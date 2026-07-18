@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 interface IngestionJob {
   id: string; 
@@ -39,6 +39,8 @@ export default function LiveIngestionStream() {
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
 
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'PROCESSING' | 'COMPLETED' | 'FAULTED'>('ALL');
@@ -92,6 +94,8 @@ export default function LiveIngestionStream() {
   const [detailLoading, setDetailLoading] = useState<boolean>(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [copied, setCopied] = useState<boolean>(false);
+  const [refinementPrompt, setRefinementPrompt] = useState<string>('');
+  const [isRefining, setIsRefining] = useState<boolean>(false);
 
   // Load configuration details from localStorage on initial render
   useEffect(() => {
@@ -115,34 +119,34 @@ export default function LiveIngestionStream() {
     }
   }, []);
 
-  useEffect(() => {
-    async function fetchPipelineData() {
-      try {
-        const response = await fetch(`${API_BASE}/api/v1/jobs`);
-        if (!response.ok) {
-          throw new Error(`Server returned status: ${response.status}`);
-        }
-        const data = await response.json();
-        
-        const formattedJobs = data.map((item: DBJobPayload) => ({
-          id: String(item.id), 
-          callId: item.callId || 'N/A',
-          geminiStatus: (item.status || 'COMPLETED') as IngestionJob['geminiStatus'],
-          outboundState: (item.outboundTriggered ? 'TRIGGERED' : 'SIMULATED') as IngestionJob['outboundState'],
-          timestamp: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A',
-          rawTranscript: item.rawTranscript || '',
-          aiAnalysisPass: item.aiAnalysisPass || ''
-        }));
-        
-        setJobs(formattedJobs);
-        setError(null);
-      } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : 'Failed to establish connection to backend API node.');
-      } finally {
-        setLoading(false);
+  const fetchPipelineData = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/jobs`);
+      if (!response.ok) {
+        throw new Error(`Server returned status: ${response.status}`);
       }
+      const data = await response.json();
+      
+      const formattedJobs = data.map((item: DBJobPayload) => ({
+        id: String(item.id), 
+        callId: item.callId || 'N/A',
+        geminiStatus: (item.status || 'COMPLETED') as IngestionJob['geminiStatus'],
+        outboundState: (item.outboundTriggered ? 'TRIGGERED' : 'SIMULATED') as IngestionJob['outboundState'],
+        timestamp: item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'N/A',
+        rawTranscript: item.rawTranscript || '',
+        aiAnalysisPass: item.aiAnalysisPass || ''
+      }));
+      
+      setJobs(formattedJobs);
+      setError(null);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to establish connection to backend API node.');
+    } finally {
+      setLoading(false);
     }
+  };
 
+  useEffect(() => {
     fetchPipelineData();
 
     // Establish Server-Sent Events (SSE) connection for real-time updates
@@ -236,6 +240,43 @@ export default function LiveIngestionStream() {
     navigator.clipboard.writeText(email);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleRefineEmail = async () => {
+    if (!jobDetail || !refinementPrompt.trim()) return;
+    setIsRefining(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/jobs/${jobDetail.id}/refine-email`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-gemini-key': customApiKey,
+          'x-ai-provider': apiProvider,
+          'x-model-name': modelName
+        },
+        body: JSON.stringify({
+          refinementPrompt: refinementPrompt.trim(),
+          tone: selectedTone
+        })
+      });
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.message || 'Failed to refine email draft.');
+      }
+      const data = await response.json();
+      setJobDetail(data.job);
+      setJobs((prevJobs) =>
+        prevJobs.map((j) => (j.id === data.job.id ? {
+          ...j,
+          aiAnalysisPass: data.job.aiAnalysisPass
+        } : j))
+      );
+      setRefinementPrompt('');
+    } catch (err: any) {
+      alert(`Refinement failed: ${err.message}`);
+    } finally {
+      setIsRefining(false);
+    }
   };
 
   const handleRetryJob = async (id: string) => {
@@ -377,6 +418,9 @@ export default function LiveIngestionStream() {
         setUploadedFileName('');
         setWebLinkUrl('');
         
+        // Immediately load new queued jobs from server
+        fetchPipelineData();
+        
         setTimeout(() => {
           setShowIngestionModal(false);
           setSimStatus({ type: 'idle', message: '' });
@@ -490,10 +534,76 @@ export default function LiveIngestionStream() {
       
       micSource.connect(destination);
       
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      micSource.connect(analyser);
+      
       if (mixSystemAudio && systemStream) {
         const systemSource = audioCtx.createMediaStreamSource(systemStream);
         systemSource.connect(destination);
+        systemSource.connect(analyser);
       }
+      
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+      
+      const drawWave = () => {
+        if (!canvasRef.current) {
+          animationFrameRef.current = requestAnimationFrame(drawWave);
+          return;
+        }
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          animationFrameRef.current = requestAnimationFrame(drawWave);
+          return;
+        }
+        
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        animationFrameRef.current = requestAnimationFrame(drawWave);
+        
+        analyser.getByteTimeDomainData(dataArray);
+        
+        ctx.fillStyle = '#0E1015';
+        ctx.fillRect(0, 0, width, height);
+        
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = '#1F2229';
+        ctx.beginPath();
+        ctx.moveTo(0, height / 2);
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#6366f1';
+        ctx.beginPath();
+        
+        const sliceWidth = width / bufferLength;
+        let x = 0;
+        
+        for (let i = 0; i < bufferLength; i++) {
+          const v = dataArray[i] / 128.0;
+          const y = (v * height) / 2;
+          
+          if (i === 0) {
+            ctx.moveTo(x, y);
+          } else {
+            ctx.lineTo(x, y);
+          }
+          
+          x += sliceWidth;
+        }
+        
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+      };
+      
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+      drawWave();
       
       const mediaRecorder = new MediaRecorder(destination.stream, { mimeType: 'audio/webm' });
       const chunks: BlobPart[] = [];
@@ -517,7 +627,14 @@ Sarah: Alex from our security team will send the ISO 27001 certifications direct
         setSimCallId(`web_live_${Math.floor(Math.random() * 9000 + 1000)}`);
         
         micStream.getTracks().forEach(track => track.stop());
-        systemStream.getTracks().forEach(track => track.stop());
+        if (systemStream) {
+          systemStream.getTracks().forEach(track => track.stop());
+        }
+        
+        if (animationFrameRef.current) {
+          cancelAnimationFrame(animationFrameRef.current);
+          animationFrameRef.current = null;
+        }
       };
       
       mediaRecorder.start();
@@ -1461,7 +1578,12 @@ Generated by GTM Context Engine.`;
                   <div className="border-2 border-dashed border-[#1F2229] rounded-sm p-8 text-center bg-[#0E1015]/40 flex flex-col items-center justify-center">
                     {isWebRecording ? (
                       <>
-                        <span className="text-3xl mb-3 animate-pulse">🔴</span>
+                        <canvas
+                          ref={canvasRef}
+                          width="300"
+                          height="60"
+                          className="w-full max-w-[300px] h-[60px] mb-3 bg-[#0E1015] border border-[#1F2229] rounded-sm"
+                        />
                         <span className="text-white block font-bold mb-1">Recording Active</span>
                         <span className="text-indigo-400 font-mono block mb-4">
                           Duration: {Math.floor(recordingDuration / 60)}:{(recordingDuration % 60).toString().padStart(2, '0')}
@@ -1635,17 +1757,37 @@ Generated by GTM Context Engine.`;
               <div>
                 <span className="text-[#737885] block mb-2 font-bold uppercase tracking-wider">Objection Risk Breakdown:</span>
                 <div className="grid grid-cols-3 gap-2">
-                  <div className="bg-[#12141A]/50 border border-[#1F2229] p-3 rounded-sm">
+                  <div className="bg-[#12141A]/50 border border-[#1F2229] p-3 rounded-sm relative group cursor-help hover:border-amber-500/30 transition-all duration-200">
                     <span className="text-amber-500 font-bold uppercase tracking-widest text-[9px] block mb-1">💰 Budget</span>
-                    <p className="text-[#A3A8B6] text-[10px] leading-relaxed font-sans">{getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.budget}</p>
+                    <p className="text-[#A3A8B6] text-[10px] leading-relaxed font-sans truncate">{getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.budget}</p>
+                    
+                    <div className="absolute z-50 left-1/2 -translate-x-1/2 bottom-full mb-2 w-64 p-3 bg-[#0F1115] border border-amber-500/40 text-slate-300 rounded shadow-2xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 text-[10px] font-sans leading-relaxed pointer-events-none">
+                      <span className="text-amber-500 font-bold block mb-1 text-[9px] uppercase tracking-wider">💰 Budget Objection Details:</span>
+                      {getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.budget}
+                      <div className="absolute top-full left-1/2 -translate-x-1/2 -mt-[5px] border-4 border-transparent border-t-[#0F1115] group-hover:border-t-amber-500/40" />
+                    </div>
                   </div>
-                  <div className="bg-[#12141A]/50 border border-[#1F2229] p-3 rounded-sm">
+                  
+                  <div className="bg-[#12141A]/50 border border-[#1F2229] p-3 rounded-sm relative group cursor-help hover:border-blue-500/30 transition-all duration-200">
                     <span className="text-blue-400 font-bold uppercase tracking-widest text-[9px] block mb-1">⚔️ Competitor</span>
-                    <p className="text-[#A3A8B6] text-[10px] leading-relaxed font-sans">{getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.competitor}</p>
+                    <p className="text-[#A3A8B6] text-[10px] leading-relaxed font-sans truncate">{getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.competitor}</p>
+                    
+                    <div className="absolute z-50 left-1/2 -translate-x-1/2 bottom-full mb-2 w-64 p-3 bg-[#0F1115] border border-blue-400/40 text-slate-300 rounded shadow-2xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 text-[10px] font-sans leading-relaxed pointer-events-none">
+                      <span className="text-blue-400 font-bold block mb-1 text-[9px] uppercase tracking-wider">⚔️ Competitor Blocker Details:</span>
+                      {getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.competitor}
+                      <div className="absolute top-full left-1/2 -translate-x-1/2 -mt-[5px] border-4 border-transparent border-t-[#0F1115] group-hover:border-t-blue-400/40" />
+                    </div>
                   </div>
-                  <div className="bg-[#12141A]/50 border border-[#1F2229] p-3 rounded-sm">
+                  
+                  <div className="bg-[#12141A]/50 border border-[#1F2229] p-3 rounded-sm relative group cursor-help hover:border-rose-500/30 transition-all duration-200">
                     <span className="text-rose-400 font-bold uppercase tracking-widest text-[9px] block mb-1">🛡️ Security</span>
-                    <p className="text-[#A3A8B6] text-[10px] leading-relaxed font-sans">{getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.security}</p>
+                    <p className="text-[#A3A8B6] text-[10px] leading-relaxed font-sans truncate">{getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.security}</p>
+                    
+                    <div className="absolute z-50 left-1/2 -translate-x-1/2 bottom-full mb-2 w-64 p-3 bg-[#0F1115] border border-rose-500/40 text-slate-300 rounded shadow-2xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 text-[10px] font-sans leading-relaxed pointer-events-none">
+                      <span className="text-rose-400 font-bold block mb-1 text-[9px] uppercase tracking-wider">🛡️ Security Risk Details:</span>
+                      {getAnalysisDetails(jobDetail.aiAnalysisPass).objectionBreakdown.security}
+                      <div className="absolute top-full left-1/2 -translate-x-1/2 -mt-[5px] border-4 border-transparent border-t-[#0F1115] group-hover:border-t-rose-500/40" />
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1683,6 +1825,35 @@ Generated by GTM Context Engine.`;
                 <pre className="w-full bg-[#0E1015] border border-[#1F2229] rounded-sm p-4 text-slate-300 whitespace-pre-wrap font-sans text-xs leading-relaxed overflow-x-auto select-all">
                   {generateFollowUpEmail(jobDetail, selectedTone)}
                 </pre>
+                
+                {/* AI Draft Copilot Section */}
+                <div className="mt-3 p-3 bg-[#090A0E] border border-[#1F2229] rounded-sm flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono tracking-widest text-[#737885] uppercase font-bold">🪄 AI Draft Copilot</span>
+                    <span className="text-[9px] font-mono text-indigo-400/80 tracking-wider">Refine tone or add instructions</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder="e.g. 'Make it shorter', 'Add 20% discount expiring July 31st'..."
+                      value={refinementPrompt}
+                      onChange={(e) => setRefinementPrompt(e.target.value)}
+                      disabled={isRefining}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleRefineEmail();
+                      }}
+                      className="flex-1 bg-[#12141A] border border-[#1F2229] rounded-sm px-3 py-1.5 text-xs font-mono text-[#E4E6EB] focus:outline-none focus:border-indigo-500/60 transition-colors placeholder-[#4F535E]"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleRefineEmail}
+                      disabled={isRefining || !refinementPrompt.trim()}
+                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-[#1E222B] disabled:text-[#4F535E] disabled:border-[#1F2229] text-white rounded-sm text-[10px] font-mono uppercase tracking-wider transition-colors cursor-pointer border border-indigo-500 disabled:cursor-not-allowed font-bold"
+                    >
+                      {isRefining ? 'Refining...' : 'Refine'}
+                    </button>
+                  </div>
+                </div>
               </div>
 
             </div>

@@ -6,6 +6,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import fastifyRateLimit from '@fastify/rate-limit';
+import { GoogleGenAI } from '@google/genai';
 
 // Initialize Fastify framework instance
 const fastify = Fastify({
@@ -36,8 +37,8 @@ const transcriptQueue = new Queue('transcript-processing', {
 // SSE clients registry
 const clients = new Set();
 
-// Dedicated PostgreSQL client for LISTEN/NOTIFY
-const listenClient = new pg.Client({ connectionString: process.env.DATABASE_URL });
+// Dedicated PostgreSQL client for LISTEN/NOTIFY (recreated on error/reconnect)
+let listenClient = null;
 
 // Register CORS plugin cleanly to accept Next.js connections from port 3001
 await fastify.register(fastifyCors, {
@@ -283,6 +284,133 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
   }
 });
 
+// 5.6. POST Refine Email Route (Calls Google Gemini / OpenRouter to dynamically refine/rewrite the outbound follow-up email draft)
+fastify.post('/api/v1/jobs/:id/refine-email', async (request, reply) => {
+  const { id } = request.params;
+  const { refinementPrompt, tone } = request.body || {};
+
+  try {
+    const job = await prisma.callSummary.findUnique({
+      where: { id: id }
+    });
+
+    if (!job) {
+      return reply.status(404).send({
+        status: 'ERROR',
+        message: `RECORD NOT FOUND: UUID #${id} could not be resolved.`
+      });
+    }
+
+    const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'] || process.env.GEMINI_API_KEY;
+    const provider = request.headers['x-ai-provider'] || 'gemini';
+    const modelName = request.headers['x-model-name'] || 'gemini-2.5-flash';
+
+    let analysis;
+    try {
+      analysis = job.aiAnalysisPass ? JSON.parse(job.aiAnalysisPass) : {};
+    } catch {
+      analysis = {
+        summary: job.aiAnalysisPass || '',
+        dealRiskScore: 'Low',
+        objectionBreakdown: { budget: 'None', competitor: 'None', security: 'None' },
+        followUpEmail: job.aiAnalysisPass || ''
+      };
+    }
+
+    const currentEmail = analysis.followUpEmail || '';
+    const transcript = job.rawTranscript || '';
+
+    const systemInstruction = `You are a world-class GTM (Go-To-Market) Sales Copilot.
+Your task is to refine and rewrite an existing follow-up email draft based on:
+1. The original meeting transcript.
+2. The current follow-up email draft.
+3. The representative's specific instruction/tweak prompt.
+4. The requested email tone: ${tone || 'Value-Led'}.
+
+Keep the email highly personalized, professional, and value-led. Focus on addressing the client needs and objections from the meeting transcript.
+Return ONLY the refined email text. Do not include subject line placeholder headers, markdown blocks like \`\`\`html or greeting wrappers unless part of the email body itself. Just output the clean email body.`;
+
+    const promptText = `### Original Meeting Transcript:
+${transcript}
+
+### Current Email Draft:
+${currentEmail}
+
+### User's Refinement Instruction:
+${refinementPrompt}
+
+### Output refined email body directly:`;
+
+    let refinedEmail = '';
+
+    const isOpenRouter = (geminiKey && geminiKey.startsWith('sk-or-')) || provider === 'openrouter';
+
+    if (isOpenRouter) {
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${geminiKey}`,
+          'HTTP-Referer': 'http://localhost:3000',
+          'X-Title': 'GTM Context Engine'
+        },
+        body: JSON.stringify({
+          model: modelName || 'anthropic/claude-3.5-sonnet',
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: promptText }
+          ]
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`OpenRouter API response error: ${response.statusText}`);
+      }
+      const data = await response.json();
+      refinedEmail = data.choices?.[0]?.message?.content?.trim() || currentEmail;
+    } else {
+      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      const response = await ai.models.generateContent({
+        model: modelName || 'gemini-2.5-flash',
+        contents: `${systemInstruction}\n\n${promptText}`
+      });
+
+      refinedEmail = response.text?.trim() || currentEmail;
+    }
+
+    // Clean up refinedEmail formatting
+    refinedEmail = refinedEmail.replace(/^```html|```$/g, '').trim();
+
+    // Update the database record with the new refined email
+    analysis.followUpEmail = refinedEmail;
+    const updatedRecord = await prisma.callSummary.update({
+      where: { id: id },
+      data: {
+        aiAnalysisPass: JSON.stringify(analysis)
+      }
+    });
+
+    // Notify clients via SSE
+    const broadcastPayload = JSON.stringify(updatedRecord);
+    for (const client of clients) {
+      client.write(`data: ${broadcastPayload}\n\n`);
+    }
+
+    return reply.status(200).send({
+      status: 'success',
+      message: 'Email draft refined successfully.',
+      refinedEmail: refinedEmail,
+      job: updatedRecord
+    });
+  } catch (error) {
+    fastify.log.error(error);
+    return reply.status(500).send({
+      status: 'FAULTED',
+      message: `REFINEMENT ERROR: ${error.message || 'Exception during AI Copilot email rewrite sequence.'}`
+    });
+  }
+});
+
 /**
  * -----------------------------------------------------------------------------
  * ENGINE STARTUP PROCEDURES
@@ -290,6 +418,12 @@ fastify.post('/api/v1/jobs/:id/retry', async (request, reply) => {
  */
 async function setupPostgresListener() {
   try {
+    if (listenClient) {
+      try {
+        await listenClient.end();
+      } catch {}
+    }
+    listenClient = new pg.Client({ connectionString: process.env.DATABASE_URL });
     await listenClient.connect();
     fastify.log.info('🔌 Connected dedicated pg client for LISTEN/NOTIFY');
     
