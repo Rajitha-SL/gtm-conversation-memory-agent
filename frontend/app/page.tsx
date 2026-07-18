@@ -80,6 +80,7 @@ export default function LiveIngestionStream() {
   const [isWebRecording, setIsWebRecording] = useState<boolean>(false);
   const [mediaRecorderRef, setMediaRecorderRef] = useState<MediaRecorder | null>(null);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [recordedAudioBase64, setRecordedAudioBase64] = useState<string>('');
   const [recordingDuration, setRecordingDuration] = useState<number>(0);
   const [recordingTimer, setRecordingTimer] = useState<any>(null);
 
@@ -391,6 +392,14 @@ export default function LiveIngestionStream() {
     setSimStatus({ type: 'idle', message: '' });
 
     try {
+      const payload: any = { callId: finalCallId };
+      if ((activeIngestionTab === 'record' || activeIngestionTab === 'upload') && recordedAudioBase64) {
+        payload.audioBase64 = recordedAudioBase64;
+        payload.mimeType = 'audio/webm';
+      } else {
+        payload.rawTranscript = simTranscript;
+      }
+
       const response = await fetch(`${API_BASE}/api/v1/webhooks/gong`, {
         method: 'POST',
         headers: { 
@@ -400,7 +409,7 @@ export default function LiveIngestionStream() {
           'x-model-name': modelName,
           'x-slack-webhook-url': slackWebhookUrl
         },
-        body: JSON.stringify({ callId: finalCallId, rawTranscript: simTranscript }),
+        body: JSON.stringify(payload),
       });
 
       const data = await response.json();
@@ -415,6 +424,7 @@ export default function LiveIngestionStream() {
         setSimStatus({ type: 'success', message: `Job staged successfully! ID: #${finalCallId}` });
         setSimCallId('');
         setSimTranscript('');
+        setRecordedAudioBase64('');
         setUploadedFileName('');
         setWebLinkUrl('');
         
@@ -455,17 +465,17 @@ export default function LiveIngestionStream() {
       };
       reader.readAsText(file);
     } else {
-      let progress = 0;
-      const interval = setInterval(() => {
-        progress += 20;
-        setUploadProgress(progress);
-        if (progress >= 100) {
-          clearInterval(interval);
-          setSimTranscript(`DevOps Lead: In our sync with the AWS Cloud Infrastructure Architecture team today, we reviewed our migration pipeline blocks. Moving off our existing AWS database nodes to GCP represents a massive operational cost barrier ($120k estimated migration expense). We need specialized cloud templates to bypass this cost lock. Principal email contact is devops_lead@targetcloud.com`);
-          const cleanName = file.name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9]/g, "_");
-          setSimCallId(`audio_${cleanName.slice(0, 15)}_${Math.floor(Math.random() * 900 + 100)}`);
-        }
-      }, 300);
+      setUploadProgress(20);
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64Data = (reader.result as string).split(',')[1];
+        setRecordedAudioBase64(base64Data);
+        setSimTranscript('[Audio Ingestion: Processing uploaded audio file...]');
+        const cleanName = file.name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9]/g, "_");
+        setSimCallId(`audio_${cleanName.slice(0, 15)}_${Math.floor(Math.random() * 900 + 100)}`);
+        setUploadProgress(100);
+      };
+      reader.readAsDataURL(file);
     }
   };
 
@@ -620,10 +630,14 @@ export default function LiveIngestionStream() {
         setUploadedFileName('web_live_session.webm');
         setUploadProgress(100);
         
-        setSimTranscript(`Mark: Thanks for jumping on, Sarah. We are reviewing our data warehouse budget. We currently pay Snowflake $50,000/yr.
-Sarah: Understood, Mark. If you migrate to GTM Context Engine, we can offer a 2-year contract at $35,000/yr.
-Mark: That sounds like a solid 30% discount. What about security? We need your ISO 27001 certs.
-Sarah: Alex from our security team will send the ISO 27001 certifications directly to Rachel on your team tomorrow.`);
+        const reader = new FileReader();
+        reader.readAsDataURL(audioBlob);
+        reader.onloadend = () => {
+          const base64Data = (reader.result as string).split(',')[1];
+          setRecordedAudioBase64(base64Data);
+        };
+        
+        setSimTranscript('[Audio Ingestion: Processing conversation...]');
         setSimCallId(`web_live_${Math.floor(Math.random() * 9000 + 1000)}`);
         
         micStream.getTracks().forEach(track => track.stop());

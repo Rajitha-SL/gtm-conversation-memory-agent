@@ -30,11 +30,44 @@ const transcriptWorker = new Worker(
   async (job) => {
     // Support both historical queue item naming formats to prevent pipeline blocks
     const callId = job.data.callId;
-    const transcript = job.data.transcriptData || job.data.transcript;
+    let transcript = job.data.transcriptData || job.data.transcript;
+    const audioBase64 = job.data.audioBase64;
+    const mimeType = job.data.mimeType || 'audio/webm';
     const apiKey = job.data.geminiKey || process.env.GEMINI_API_KEY;
     const provider = job.data.provider || (apiKey?.startsWith('sk-or-') ? 'openrouter' : 'gemini');
     const modelName = job.data.modelName || (provider === 'openrouter' ? 'anthropic/claude-3.5-sonnet' : 'gemini-2.5-flash');
     const slackWebhookUrl = job.data.slackWebhookUrl;
+
+    if (audioBase64) {
+      logger.info({ jobId: job.id, callId }, 'Processing raw audio file upload...');
+      if (provider === 'openrouter') {
+        throw new Error('AUDIO_TRANSCRIPTION_UNSUPPORTED: Audio transcription is only supported using native Gemini provider.');
+      }
+      
+      const ai = new GoogleGenAI({ apiKey });
+      logger.info({ jobId: job.id, callId }, 'Requesting audio transcription from Gemini...');
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: [
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: audioBase64
+            }
+          },
+          "Transcribe the conversation in this audio file word-for-word. Do not summarize or add notes. If it is only one person talking, transcribe exactly what they say. Return only the raw transcript text."
+        ]
+      });
+      transcript = response.text?.trim() || '';
+      logger.info({ jobId: job.id, callId, transcriptLength: transcript.length }, 'Audio transcription successfully completed.');
+      
+      await prisma.callSummary.update({
+        where: { callId: callId },
+        data: {
+          rawTranscript: transcript
+        }
+      });
+    }
 
     if (!transcript) {
       logger.warn({ jobId: job.id, callId }, 'No transcript string text found in job payload keys!');

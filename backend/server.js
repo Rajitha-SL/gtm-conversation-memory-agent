@@ -150,10 +150,12 @@ fastify.get('/api/v1/jobs/stream', (request, reply) => {
 const gongSchema = {
   body: {
     type: 'object',
-    required: ['callId', 'rawTranscript'],
+    required: ['callId'],
     properties: {
       callId: { type: 'string', minLength: 1 },
-      rawTranscript: { type: 'string', minLength: 1 }
+      rawTranscript: { type: 'string' },
+      audioBase64: { type: 'string' },
+      mimeType: { type: 'string' }
     }
   }
 };
@@ -168,25 +170,32 @@ fastify.post('/api/v1/webhooks/gong', {
   },
   schema: gongSchema
 }, async (request, reply) => {
-  const { callId, rawTranscript } = request.body;
+  const { callId, rawTranscript, audioBase64, mimeType } = request.body;
   const geminiKey = request.headers['x-gemini-key'] || request.headers['x-api-key'];
   const provider = request.headers['x-ai-provider'];
   const modelName = request.headers['x-model-name'];
   const slackWebhookUrl = request.headers['x-slack-webhook-url'];
+
+  if (!rawTranscript && !audioBase64) {
+    return reply.status(400).send({
+      status: 'ERROR',
+      message: 'INSUFFICIENT FIELDS: Either rawTranscript or audioBase64 must be provided.'
+    });
+  }
 
   try {
     // 1. Instantly stage basic execution frame to PostgreSQL via Prisma using upsert
     const newRecord = await prisma.callSummary.upsert({
       where: { callId: callId },
       update: {
-        rawTranscript: rawTranscript,
+        rawTranscript: rawTranscript || '[Audio Ingestion: Processing conversation...]',
         status: 'PROCESSING',
         outboundTriggered: false,
         aiAnalysisPass: ''
       },
       create: {
         callId: callId,
-        rawTranscript: rawTranscript,
+        rawTranscript: rawTranscript || '[Audio Ingestion: Processing conversation...]',
         status: 'PROCESSING',
         outboundTriggered: false,
         aiAnalysisPass: ''
@@ -197,6 +206,8 @@ fastify.post('/api/v1/webhooks/gong', {
     await transcriptQueue.add('process-gong-raw', {
       callId: callId,
       transcript: rawTranscript,
+      audioBase64: audioBase64,
+      mimeType: mimeType,
       geminiKey: geminiKey,
       provider: provider,
       modelName: modelName,
